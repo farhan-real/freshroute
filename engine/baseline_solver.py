@@ -9,15 +9,19 @@ class BaselineSolver:
     Standard naive baseline:
     - Dispatches oldest batches first (FIFO) to fulfill orders in order of destination demand.
     - Zero dynamic discounting.
-    - Destination rejection: Produce arriving with < 2.0h buffer is rejected at dock as spoiled.
+    - Retail inspection: Shipments arriving with < 6.0h shelf-life buffer without discounting
+      fail commercial inspection and are rejected at the dock as spoiled.
     """
+
+    def __init__(self, min_retail_buffer_hrs: float = 6.0, spoilage_penalty_per_kg: float = 5.0):
+        self.min_retail_buffer_hrs = min_retail_buffer_hrs
+        self.spoilage_penalty_per_kg = spoilage_penalty_per_kg
 
     def solve(
         self,
         batches: List[Batch],
         destinations: List[Destination],
-        routes: List[TransportRoute],
-        spoilage_penalty_per_kg: float = 5.0
+        routes: List[TransportRoute]
     ) -> OptimizationSummary:
         route_map = {(r.origin, r.dest_id): r for r in routes}
         remaining_demand = {d.dest_id: d.demand_kg for d in destinations}
@@ -32,7 +36,6 @@ class BaselineSolver:
         for batch in sorted_batches:
             batch_qty = batch.quantity_kg
 
-            # Naive FIFO: fills destination orders as they appear in the queue
             candidate_dests = [
                 d for d in destinations
                 if d.commodity == batch.commodity and remaining_demand[d.dest_id] > 0
@@ -57,10 +60,11 @@ class BaselineSolver:
                 discount = 0.0
                 final_price = dest.selling_price_per_kg
 
-                # Retail quality check: In real logistics, if buffer < 2.0h, retailer rejects shipment
-                if buffer < 2.0:
+                # Retail quality check: In real logistics, if buffer < 6.0h and no clearance discount,
+                # the shipment is rejected at the dock and dumped as spoilage.
+                if buffer < self.min_retail_buffer_hrs:
                     spoiled_kg += alloc_qty
-                    reason = f"REJECTED/SPOILED: Arrived with insufficient buffer ({buffer:.1f}h < 2.0h min retail window)."
+                    reason = f"REJECTED/SPOILED: Arrived with insufficient buffer ({buffer:.1f}h < {self.min_retail_buffer_hrs}h contracted window)."
                     gross_rev = 0.0
                 else:
                     gross_rev = alloc_qty * final_price
@@ -101,11 +105,11 @@ class BaselineSolver:
         tot_gross = sum(a.gross_revenue for a in allocations)
         tot_trans = sum(a.transport_cost_total for a in allocations)
         tot_proc = sum(a.procurement_cost_total for a in allocations)
-        waste_penalty = spoiled_kg * spoilage_penalty_per_kg
+        waste_penalty = spoiled_kg * self.spoilage_penalty_per_kg
         net_profit = tot_gross - tot_trans - tot_proc - waste_penalty
 
         total_demand = sum(d.demand_kg for d in destinations)
-        fulfilled = sum(a.quantity_kg for a in allocations if a.shelf_life_buffer_hrs >= 2.0)
+        fulfilled = sum(a.quantity_kg for a in allocations if a.shelf_life_buffer_hrs >= self.min_retail_buffer_hrs)
         fulfillment_pct = (fulfilled / total_demand * 100) if total_demand > 0 else 0
         spoilage_pct = (spoiled_kg / total_inventory_kg * 100) if total_inventory_kg > 0 else 0
 

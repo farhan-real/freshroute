@@ -7,19 +7,19 @@ from .models import Batch, Destination, TransportRoute, AllocationDecision, Opti
 class FreshRouteSolver:
     """
     Intelligent Decision Engine:
-    1. Feasibility: Ensures remaining_shelf_life >= travel_time + handling_time + min_safe_buffer.
-    2. Dynamic Clearance Discounting: Calibrated discounts (up to 30%) on near-expiry stock
-       ensure immediate mandi turnover and prevent warehouse spoilage.
-    3. Perishability-Aware Margin Optimization: Routes short-shelf stock to close hubs
-       and long-shelf stock to high-margin distant markets (e.g. Goa/Surat).
+    1. Feasibility: Ensures remaining_shelf_life >= travel_time + handling_time + min_safe_buffer (2h).
+    2. Targeted Dynamic Clearance: Applies calibrated discounts (0-25%) ONLY when buffer is tight (< 12h)
+       to guarantee mandi acceptance and rapid clearance without sacrificing margin on fresh stock.
+    3. Profit Optimization: Routes high-shelf produce to premium markets (Goa/Surat) and aging produce
+       to close regional hubs (Pune/Mumbai).
     4. Capacity & Demand Bounds: Strictly enforces destination reception and vehicle limits.
     """
 
     def __init__(
         self,
         min_safe_buffer_hrs: float = 2.0,
-        discount_threshold_hrs: float = 20.0,
-        max_discount_pct: float = 0.30,
+        discount_threshold_hrs: float = 12.0,
+        max_discount_pct: float = 0.25,
         spoilage_penalty_per_kg: float = 5.0
     ):
         self.min_safe_buffer_hrs = min_safe_buffer_hrs
@@ -34,7 +34,7 @@ class FreshRouteSolver:
         if buffer_hrs >= self.discount_threshold_hrs:
             return 0.0, "Full Price (Adequate Buffer)"
         
-        # Dynamic clearance discount
+        # Only discount tight buffers (< 12h)
         urgency_factor = (self.discount_threshold_hrs - buffer_hrs) / self.discount_threshold_hrs
         discount = round(urgency_factor * self.max_discount_pct, 2)
         return discount, f"Dynamic clearance {int(discount*100)}% applied: buffer is {buffer_hrs:.1f}h"
@@ -74,9 +74,9 @@ class FreshRouteSolver:
                 if unit_margin <= 0:
                     continue
 
-                # Prioritize batches with low shelf life for urgent dispatch
-                urgency_score = 1.0 + (5.0 / max(b.remaining_shelf_life_hrs, 1.0))
-                priority_index = unit_margin * urgency_score
+                # Prioritize high margin, with priority boost for urgent batches
+                urgency_multiplier = 1.0 + (3.0 / max(b.remaining_shelf_life_hrs, 1.0))
+                priority_index = unit_margin * urgency_multiplier
 
                 candidates.append({
                     "batch": b,
@@ -90,7 +90,7 @@ class FreshRouteSolver:
                     "priority_index": priority_index
                 })
 
-        # Sort candidates by multi-objective priority index descending
+        # Sort candidates by calculated priority index descending
         candidates.sort(key=lambda x: x["priority_index"], reverse=True)
 
         batch_remaining_qty = {b.batch_id: b.quantity_kg for b in batches}
