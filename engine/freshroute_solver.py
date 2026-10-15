@@ -1,4 +1,4 @@
-"""engine/freshroute_solver.py: Intelligent Constrained Optimization Solver."""
+"""engine/freshroute_solver.py: Intelligent Constrained Optimization Solver with Clearance Elasticity."""
 
 from typing import List, Dict, Tuple
 from .models import Batch, Destination, TransportRoute, AllocationDecision, OptimizationSummary
@@ -8,11 +8,11 @@ class FreshRouteSolver:
     """
     Intelligent Decision Engine:
     1. Feasibility: Ensures remaining_shelf_life >= travel_time + handling_time + min_safe_buffer (2h).
-    2. Targeted Dynamic Clearance: Applies calibrated discounts (0-25%) ONLY when buffer is tight (< 12h)
-       to guarantee mandi acceptance and rapid clearance without sacrificing margin on fresh stock.
-    3. Profit Optimization: Routes high-shelf produce to premium markets (Goa/Surat) and aging produce
-       to close regional hubs (Pune/Mumbai).
-    4. Capacity & Demand Bounds: Strictly enforces destination reception and vehicle limits.
+    2. Targeted Dynamic Clearance: Applies calibrated discounts (0-25%) when buffer is tight (< 12h)
+       to guarantee mandi absorption and prevent spoilage.
+    3. Clearance Elasticity: If discount is too low on tight-buffer produce, buyers do not absorb
+       the stock fast enough, causing unsold produce to spoil.
+    4. Profit Optimization: Balances margin retention vs. clearance velocity to find the optimal price.
     """
 
     def __init__(
@@ -27,17 +27,37 @@ class FreshRouteSolver:
         self.max_discount_pct = max_discount_pct
         self.spoilage_penalty_per_kg = spoilage_penalty_per_kg
 
-    def calculate_discount(self, buffer_hrs: float) -> Tuple[float, str]:
-        """Calculates dynamic discount based on remaining shelf life buffer upon arrival."""
+    def calculate_discount_and_clearance(self, buffer_hrs: float) -> Tuple[float, float, str]:
+        """
+        Calculates dynamic discount and expected market clearance rate.
+        If buffer is tight (< 12h), the market requires a minimum incentive to clear inventory in time.
+        """
         if buffer_hrs <= 0:
-            return 0.0, "EXPIRED"
+            return 0.0, 0.0, "EXPIRED"
         if buffer_hrs >= self.discount_threshold_hrs:
-            return 0.0, "Full Price (Adequate Buffer)"
+            # Full buffer: 100% clearance at full price
+            return 0.0, 1.0, "Full Price (Adequate Buffer)"
         
-        # Only discount tight buffers (< 12h)
-        urgency_factor = (self.discount_threshold_hrs - buffer_hrs) / self.discount_threshold_hrs
-        discount = round(urgency_factor * self.max_discount_pct, 2)
-        return discount, f"Dynamic clearance {int(discount*100)}% applied: buffer is {buffer_hrs:.1f}h"
+        # Urgency factor (0.0 to 1.0)
+        urgency = (self.discount_threshold_hrs - buffer_hrs) / self.discount_threshold_hrs
+        
+        # Minimum discount market expects to absorb near-expiry stock fast
+        required_clearance_discount = urgency * 0.20
+        
+        # Actual discount applied by distributor's policy
+        actual_discount = round(urgency * self.max_discount_pct, 2)
+        
+        # Clearance elasticity: If distributor under-discounts, market clearance drops
+        if actual_discount >= required_clearance_discount:
+            clearance_rate = 1.0
+            reason = f"Dynamic clearance {int(actual_discount*100)}% applied: 100% inventory cleared in time"
+        else:
+            # Under-discounting penalty: produce sells too slowly and a fraction spoils
+            shortfall = required_clearance_discount - actual_discount
+            clearance_rate = max(0.50, round(1.0 - (shortfall * 2.5), 2))
+            reason = f"Under-discounted ({int(actual_discount*100)}% vs {int(required_clearance_discount*100)}% req): only {int(clearance_rate*100)}% cleared before expiry"
+
+        return actual_discount, clearance_rate, reason
 
     def solve(
         self,
@@ -63,18 +83,16 @@ class FreshRouteSolver:
                 total_transit_hrs = route.travel_time_hrs + d.handling_time_hrs
                 buffer_hrs = b.remaining_shelf_life_hrs - total_transit_hrs
 
-                # Feasibility check: must arrive with at least minimal safe buffer
                 if buffer_hrs < self.min_safe_buffer_hrs:
                     continue
 
-                discount_pct, discount_reason = self.calculate_discount(buffer_hrs)
+                discount_pct, clearance_rate, discount_reason = self.calculate_discount_and_clearance(buffer_hrs)
                 effective_price = d.selling_price_per_kg * (1.0 - discount_pct)
                 unit_margin = effective_price - route.cost_per_kg - b.base_cost_per_kg
 
                 if unit_margin <= 0:
                     continue
 
-                # Prioritize high margin, with priority boost for urgent batches
                 urgency_multiplier = 1.0 + (3.0 / max(b.remaining_shelf_life_hrs, 1.0))
                 priority_index = unit_margin * urgency_multiplier
 
@@ -84,18 +102,19 @@ class FreshRouteSolver:
                     "route": route,
                     "buffer_hrs": buffer_hrs,
                     "discount_pct": discount_pct,
+                    "clearance_rate": clearance_rate,
                     "discount_reason": discount_reason,
                     "effective_price": effective_price,
                     "unit_margin": unit_margin,
                     "priority_index": priority_index
                 })
 
-        # Sort candidates by calculated priority index descending
         candidates.sort(key=lambda x: x["priority_index"], reverse=True)
 
         batch_remaining_qty = {b.batch_id: b.quantity_kg for b in batches}
         allocations: List[AllocationDecision] = []
         dispatched_kg = 0.0
+        spoiled_kg = 0.0
 
         for cand in candidates:
             b: Batch = cand["batch"]
@@ -113,13 +132,19 @@ class FreshRouteSolver:
             if alloc_qty <= 0:
                 continue
 
-            gross = alloc_qty * cand["effective_price"]
+            clearance = cand["clearance_rate"]
+            sold_qty = alloc_qty * clearance
+            unsold_spoiled_qty = alloc_qty * (1.0 - clearance)
+
+            spoiled_kg += unsold_spoiled_qty
+
+            gross = sold_qty * cand["effective_price"]
             t_cost = alloc_qty * r.cost_per_kg
             p_cost = alloc_qty * b.base_cost_per_kg
             net = gross - t_cost - p_cost
 
             reason = (
-                f"FreshRoute Optimized: Margin ₹{cand['unit_margin']:.1f}/kg. "
+                f"FreshRoute: Margin ₹{cand['unit_margin']:.1f}/kg. "
                 f"Buffer {cand['buffer_hrs']:.1f}h. {cand['discount_reason']}."
             )
 
@@ -148,8 +173,7 @@ class FreshRouteSolver:
             remaining_route_cap[(r.origin, r.dest_id)] -= alloc_qty
             dispatched_kg += alloc_qty
 
-        # Spoilage assessment for unallocated inventory
-        spoiled_kg = 0.0
+        # Unallocated inventory expiring in warehouse
         for b in batches:
             rem = batch_remaining_qty[b.batch_id]
             if rem > 0 and b.remaining_shelf_life_hrs <= 24.0:
@@ -164,15 +188,16 @@ class FreshRouteSolver:
         net_profit = tot_gross - tot_trans - tot_proc - waste_penalty
 
         total_demand = sum(d.demand_kg for d in destinations)
-        fulfillment_pct = (dispatched_kg / total_demand * 100) if total_demand > 0 else 0
+        fulfilled_kg = sum(a.quantity_kg * cand["clearance_rate"] for a, cand in zip(allocations, candidates[:len(allocations)]))
+        fulfillment_pct = (fulfilled_kg / total_demand * 100) if total_demand > 0 else 0
         spoilage_pct = (spoiled_kg / total_inventory_kg * 100) if total_inventory_kg > 0 else 0
 
         return OptimizationSummary(
             strategy_name="FreshRoute Intelligent Engine",
             total_inventory_kg=total_inventory_kg,
             dispatched_kg=dispatched_kg,
-            spoiled_kg=spoiled_kg,
-            unsold_unspoiled_kg=unsold_unspoiled,
+            spoiled_kg=round(spoiled_kg, 1),
+            unsold_unspoiled_kg=round(unsold_unspoiled, 1),
             spoilage_rate_pct=round(spoilage_pct, 2),
             demand_fulfillment_pct=round(fulfillment_pct, 2),
             total_gross_revenue=round(tot_gross, 2),
