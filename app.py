@@ -63,38 +63,140 @@ st.set_page_config(
     layout="wide"
 )
 
+# ----------------- SIDEBAR: REDESIGNED CONTROL CONSOLE -----------------
+
+with st.sidebar:
+    st.markdown(
+        """
+        <div style="padding-bottom: 12px; border-bottom: 1px solid #334155; margin-bottom: 16px;">
+            <div style="font-size: 0.72rem; font-weight: 800; color: #38bdf8; letter-spacing: 0.15em; text-transform: uppercase;">
+                Control Console
+            </div>
+            <div style="font-size: 1.25rem; font-weight: 700; color: #f8fafc; margin-top: 2px;">
+                Policy & Simulation
+            </div>
+            <div style="font-size: 0.8rem; color: #94a3b8; margin-top: 2px;">
+                Origin Hub: Nashik Central Corridor
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    # Section 1: Disruption Injection
+    st.markdown(
+        """
+        <div style="font-size: 0.72rem; font-weight: 700; color: #f59e0b; letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 6px;">
+            Environment Shock Testing
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    disruption_toggle = st.toggle("Simulate Supply-Chain Disruption", value=False)
+
+    if disruption_toggle:
+        st.markdown(
+            """
+            <div style="display: inline-block; font-size: 0.72rem; font-weight: 700; padding: 2px 8px; border-radius: 4px; background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4); margin-bottom: 10px;">
+                DISRUPTION ACTIVE // MONSOON DELAYS
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        transit_delay = st.slider("Highway Transit Delay (Hours)", 1.0, 12.0, 6.0, step=0.5, help="Simulates road blockages, landslide detours, or toll delays.")
+        demand_shock = st.slider("Destination Demand Drop (%)", 0, 50, 30, step=5, help="Simulates mandi shutdowns or purchasing cutbacks.") / 100.0
+    else:
+        st.markdown(
+            """
+            <div style="display: inline-block; font-size: 0.72rem; font-weight: 700; padding: 2px 8px; border-radius: 4px; background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); margin-bottom: 10px;">
+                NORMAL TRANSIT CONDITIONS
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        transit_delay = 0.0
+        demand_shock = 0.0
+
+    st.markdown("<div style='margin: 16px 0; border-top: 1px solid #334155;'></div>", unsafe_allow_html=True)
+
+    # Section 2: Policy Configuration
+    st.markdown(
+        """
+        <div style="font-size: 0.72rem; font-weight: 700; color: #a78bfa; letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 6px;">
+            Optimization Hyperparameters
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    min_buffer = st.slider(
+        "Safe Shelf Buffer Threshold (Hours)",
+        min_value=1.0,
+        max_value=8.0,
+        value=2.0,
+        step=0.5,
+        help="Minimum remaining shelf life upon arrival. Routes below this are marked infeasible."
+    )
+    st.caption("Lowering buffer allows rapid local sales; raising it enforces stricter quality margins.")
+
+    max_discount = st.slider(
+        "Dynamic Discount Ceiling (%)",
+        min_value=5,
+        max_value=40,
+        value=25,
+        step=5,
+        help="Maximum allowable price reduction to stimulate clearance of near-expiry inventory."
+    ) / 100.0
+    st.caption("Calibrated clearance curve ensures rapid mandi absorption without margin erosion.")
+
+    st.markdown("<div style='margin: 18px 0; border-top: 1px solid #334155;'></div>", unsafe_allow_html=True)
+
+    # Section 3: Live System Telemetry Card
+    st.markdown(
+        """
+        <div style="background-color: #0f172a; padding: 14px; border-radius: 8px; border: 1px solid #334155;">
+            <div style="font-size: 0.68rem; font-weight: 800; color: #64748b; letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 8px;">
+                Engine Architecture
+            </div>
+            <div style="display: flex; justify-content: space-between; font-size: 0.78rem; color: #94a3b8; margin-bottom: 5px;">
+                <span>Active Batches</span>
+                <span style="color: #f1f5f9; font-weight: 600;">9 Batches (27.8T)</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; font-size: 0.78rem; color: #94a3b8; margin-bottom: 5px;">
+                <span>Target Mandis</span>
+                <span style="color: #f1f5f9; font-weight: 600;">6 Major Markets</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; font-size: 0.78rem; color: #94a3b8; margin-bottom: 5px;">
+                <span>Algorithm Mode</span>
+                <span style="color: #38bdf8; font-weight: 600;">Urgency-Margin LP</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; font-size: 0.78rem; color: #94a3b8;">
+                <span>Constraints State</span>
+                <span style="color: #34d399; font-weight: 600;">Strictly Enforced</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+# ----------------- MAIN DASHBOARD CONTENT -----------------
+
 st.title("FreshRoute: Perishable Produce Distribution System")
 st.caption("PS 07 - IEEE RAS VITC Buildathon - Decision Support for MoFPI Post-Harvest Loss Mitigation")
 
-# Sidebar Controls
-st.sidebar.header("Scenario and Policy Controls")
-
-disruption_toggle = st.sidebar.toggle("Simulate Supply-Chain Shock (Disruption)", value=False)
-if disruption_toggle:
-    transit_delay = st.sidebar.slider("Highway Transit Delay (Hours)", 1.0, 12.0, 6.0, step=0.5)
-    demand_shock = st.sidebar.slider("Destination Demand Drop (%)", 0, 50, 30, step=5) / 100.0
-else:
-    transit_delay = 0.0
-    demand_shock = 0.0
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("FreshRoute Parameters")
-min_buffer = st.sidebar.slider("Minimum Safe Shelf Buffer (Hours)", min_value=1.0, max_value=8.0, value=2.0, step=0.5)
-max_discount = st.sidebar.slider("Maximum Dynamic Discount (%)", min_value=5, max_value=40, value=25, step=5) / 100.0
-
-# Load Data
+# Load Data & Run Solvers
 batches, destinations, routes = get_standard_scenario()
 if disruption_toggle:
     routes, destinations = apply_disruption(routes, destinations, delay_hours=transit_delay, demand_shock_pct=-demand_shock)
 
-# Execute Solvers
 baseline_solver = BaselineSolver()
 fresh_solver = FreshRouteSolver(min_safe_buffer_hrs=min_buffer, max_discount_pct=max_discount)
 
 base_res = baseline_solver.solve(batches, destinations, routes)
 fresh_res = fresh_solver.solve(batches, destinations, routes)
 
-# Calculations
+# Financial & Operational Calculations
 profit_gain = fresh_res.net_profit - base_res.net_profit
 profit_pct = (profit_gain / max(abs(base_res.net_profit), 1)) * 100
 
