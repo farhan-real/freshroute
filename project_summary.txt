@@ -1,0 +1,2247 @@
+﻿==================================================
+PROJECT DIRECTORY STRUCTURE
+==================================================
++-- engine
+|   +-- baseline_solver.py
+|   +-- data_generator.py
+|   +-- explainability.py
+|   +-- freshroute_solver.py
+|   +-- models.py
+|   +-- __init__.py
++-- tests
+|   +-- test_freshroute.py
++-- .gitignore
++-- app.py
++-- pytest.ini
++-- README.md
++-- requirements.txt
++-- run_demo.py
+
+
+==================================================
+FILE: .\app.py
+==================================================
+"""app.py: FreshRoute Interactive Decision-Support Dashboard (WCAG Accessible & XSS-Hardened)."""
+
+import html
+from typing import Literal, Tuple
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+from engine.baseline_solver import BaselineSolver
+from engine.data_generator import (
+    apply_disruption,
+    apply_temperature_excursion,
+    get_standard_scenario,
+)
+from engine.explainability import DecisionExplainer, format_inr
+from engine.freshroute_solver import FreshRouteSolver
+from engine.models import OptimizationSummary, UncertaintyReport
+
+
+@st.cache_data(show_spinner=False)
+def run_cached_simulation(
+    disruption_active: bool,
+    transit_delay: float,
+    demand_shock: float,
+    ambient_temp_c: float,
+    min_buffer: float,
+    max_discount: float,
+    solver_mode: Literal["urgency_margin", "lp_highs"],
+) -> Tuple[OptimizationSummary, OptimizationSummary, UncertaintyReport, pd.DataFrame]:
+    """Cached simulation pipeline for O(1) UI responsiveness across widget interactions."""
+    batches, destinations, routes = get_standard_scenario()
+    if ambient_temp_c > 4.0:
+        batches = apply_temperature_excursion(batches, ambient_temp_c=ambient_temp_c)
+    if disruption_active:
+        routes, destinations = apply_disruption(
+            routes,
+            destinations,
+            delay_hours=transit_delay,
+            demand_shock_pct=-demand_shock,
+        )
+
+    baseline_solver = BaselineSolver()
+    fresh_solver = FreshRouteSolver(
+        min_safe_buffer_hrs=min_buffer,
+        max_discount_pct=max_discount,
+        solver_mode=solver_mode,
+    )
+
+    base_res = baseline_solver.solve(batches, destinations, routes)
+    fresh_res = fresh_solver.solve(batches, destinations, routes)
+    mc_report = fresh_solver.evaluate_uncertainty(batches, destinations, routes, runs=40)
+    batch_df = pd.DataFrame([b.model_dump() for b in batches])
+    return base_res, fresh_res, mc_report, batch_df
+
+
+def render_metric_card(
+    title: str,
+    main_val: str,
+    vs_val: str,
+    delta_text: str,
+    is_positive: bool,
+    arrow: str,
+) -> None:
+    """
+    Renders an accessible, XSS-sanitized metric card with ARIA semantics
+    and WCAG AA compliant contrast ratios.
+    """
+    safe_title = html.escape(str(title))
+    safe_main = html.escape(str(main_val))
+    safe_vs = html.escape(str(vs_val))
+    safe_delta = html.escape(str(delta_text))
+    safe_arrow = html.escape(str(arrow))
+    sr_status = "Favorable change" if is_positive else "Unfavorable change"
+
+    # Colorblind-safe high-contrast badge styling (Sky Blue vs Amber/Orange)
+    badge_bg = "rgba(14, 165, 233, 0.18)" if is_positive else "rgba(245, 158, 11, 0.18)"
+    badge_color = "#38bdf8" if is_positive else "#fbbf24"
+    badge_border = (
+        "1px solid rgba(56, 189, 248, 0.45)"
+        if is_positive
+        else "1px solid rgba(251, 191, 36, 0.45)"
+    )
+
+    card_html = f"""
+    <div role="region" aria-label="{safe_title}: {safe_main} compared to baseline {safe_vs}, {sr_status} {safe_delta}"
+         style="background-color: #1e293b; padding: 18px 22px; border-radius: 10px; border: 1px solid #334155; margin-bottom: 16px;">
+        <div style="color: #cbd5e1; font-size: 0.95rem; font-weight: 600; margin-bottom: 8px;">{safe_title}</div>
+        <div style="display: flex; align-items: baseline; flex-wrap: wrap; gap: 12px; margin-bottom: 10px;">
+            <span style="color: #ffffff; font-size: 1.75rem; font-weight: 700; letter-spacing: -0.02em;">{safe_main}</span>
+            <span style="color: #94a3b8; font-size: 1.25rem; font-weight: 500;">vs {safe_vs}</span>
+        </div>
+        <div style="display: inline-flex; align-items: center; gap: 6px; background-color: {badge_bg}; color: {badge_color}; border: {badge_border}; font-size: 0.85rem; font-weight: 600; padding: 4px 10px; border-radius: 9999px;">
+            <span aria-hidden="true">{safe_arrow}</span>
+            <span>{safe_delta}</span>
+        </div>
+    </div>
+    """
+    st.markdown(card_html, unsafe_allow_html=True)
+
+
+st.set_page_config(
+    page_title="FreshRoute | Decision Support System",
+    layout="wide",
+)
+
+# ----------------- SIDEBAR: REDESIGNED CONTROL CONSOLE -----------------
+
+with st.sidebar:
+    st.markdown(
+        """
+        <div style="padding-bottom: 12px; border-bottom: 1px solid #334155; margin-bottom: 16px;">
+            <div style="font-size: 0.72rem; font-weight: 800; color: #38bdf8; letter-spacing: 0.15em; text-transform: uppercase;">
+                Control Console
+            </div>
+            <div style="font-size: 1.25rem; font-weight: 700; color: #f8fafc; margin-top: 2px;">
+                Policy &amp; Simulation
+            </div>
+            <div style="font-size: 0.8rem; color: #cbd5e1; margin-top: 2px;">
+                Origin Hub: Nashik Central Corridor
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        """
+        <div style="font-size: 0.72rem; font-weight: 700; color: #f59e0b; letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 6px;">
+            Environment Shock Testing
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    disruption_toggle = st.toggle(
+        "Simulate Supply-Chain Disruption",
+        value=False,
+        help="Inject highway transit delays and destination market demand shocks.",
+    )
+
+    if disruption_toggle:
+        st.markdown(
+            """
+            <div role="status" style="display: inline-block; font-size: 0.72rem; font-weight: 700; padding: 2px 8px; border-radius: 4px; background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.45); margin-bottom: 10px;">
+                DISRUPTION ACTIVE // MONSOON DELAYS
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        transit_delay = st.slider(
+            "Highway Transit Delay (Hours)",
+            1.0,
+            12.0,
+            6.0,
+            step=0.5,
+            help="Simulates road blockages, landslide detours, or toll delays.",
+        )
+        demand_shock = (
+            st.slider(
+                "Destination Demand Drop (%)",
+                0,
+                50,
+                30,
+                step=5,
+                help="Simulates mandi shutdowns or purchasing cutbacks.",
+            )
+            / 100.0
+        )
+    else:
+        st.markdown(
+            """
+            <div role="status" style="display: inline-block; font-size: 0.72rem; font-weight: 700; padding: 2px 8px; border-radius: 4px; background: rgba(14, 165, 233, 0.18); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.35); margin-bottom: 10px;">
+                NORMAL TRANSIT CONDITIONS
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        transit_delay = 0.0
+        demand_shock = 0.0
+
+    ambient_temp_c = st.slider(
+        "Cold-Chain Storage Temp (\u00b0C)",
+        min_value=4.0,
+        max_value=24.0,
+        value=4.0,
+        step=2.0,
+        help="Simulates reefer cooling excursions using Q10 biological respiration decay (4\u00b0C = nominal).",
+    )
+
+    st.markdown(
+        "<div style='margin: 16px 0; border-top: 1px solid #334155;'></div>",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        """
+        <div style="font-size: 0.72rem; font-weight: 700; color: #a78bfa; letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 6px;">
+            Optimization Hyperparameters
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    min_buffer = st.slider(
+        "Safe Shelf Buffer Threshold (Hours)",
+        min_value=1.0,
+        max_value=8.0,
+        value=2.0,
+        step=0.5,
+        help="Minimum remaining shelf life upon arrival. Routes below this are marked infeasible.",
+    )
+    st.caption("Lowering buffer allows rapid local sales; raising it enforces stricter quality margins.")
+
+    max_discount = (
+        st.slider(
+            "Dynamic Discount Ceiling (%)",
+            min_value=5,
+            max_value=40,
+            value=25,
+            step=5,
+            help="Maximum allowable price reduction to stimulate clearance of near-expiry inventory.",
+        )
+        / 100.0
+    )
+    st.caption("Calibrated clearance curve ensures rapid mandi absorption without margin erosion.")
+
+    solver_label = st.selectbox(
+        "Optimization Engine Mode",
+        options=["Urgency-Margin Heuristic (Default)", "SciPy HiGHS Linear Program (Exact LP)"],
+        index=0,
+        help="Switch between Priority-Index heuristic and SciPy HiGHS Linear Programming.",
+    )
+    solver_mode: Literal["urgency_margin", "lp_highs"] = (
+        "lp_highs" if "HiGHS" in solver_label else "urgency_margin"
+    )
+
+    st.markdown(
+        "<div style='margin: 18px 0; border-top: 1px solid #334155;'></div>",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        """
+        <div style="background-color: #0f172a; padding: 14px; border-radius: 8px; border: 1px solid #334155;">
+            <div style="font-size: 0.68rem; font-weight: 800; color: #94a3b8; letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 8px;">
+                Engine Architecture
+            </div>
+            <div style="display: flex; justify-content: space-between; font-size: 0.78rem; color: #cbd5e1; margin-bottom: 5px;">
+                <span>Active Batches</span>
+                <span style="color: #f8fafc; font-weight: 600;">9 Batches (27.8T)</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; font-size: 0.78rem; color: #cbd5e1; margin-bottom: 5px;">
+                <span>Target Mandis</span>
+                <span style="color: #f8fafc; font-weight: 600;">10 Market Lines</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; font-size: 0.78rem; color: #cbd5e1; margin-bottom: 5px;">
+                <span>Accessibility</span>
+                <span style="color: #38bdf8; font-weight: 600;">WCAG AA + Patterns</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; font-size: 0.78rem; color: #cbd5e1;">
+                <span>Constraints State</span>
+                <span style="color: #38bdf8; font-weight: 600;">Strictly Enforced</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# ----------------- MAIN DASHBOARD CONTENT -----------------
+
+st.title("FreshRoute: Perishable Produce Distribution System")
+st.caption(
+    "PS 07 \u2014 IEEE RAS VITC Buildathon \u2014 Decision Support for MoFPI Post-Harvest Loss Mitigation"
+)
+
+base_res, fresh_res, mc_report, batch_df = run_cached_simulation(
+    disruption_active=disruption_toggle,
+    transit_delay=transit_delay,
+    demand_shock=demand_shock,
+    ambient_temp_c=ambient_temp_c,
+    min_buffer=min_buffer,
+    max_discount=max_discount,
+    solver_mode=solver_mode,
+)
+
+profit_gain = fresh_res.net_profit - base_res.net_profit
+profit_pct = (profit_gain / max(abs(base_res.net_profit), 1.0)) * 100.0
+
+spoilage_delta = fresh_res.spoilage_rate_pct - base_res.spoilage_rate_pct
+fulfill_delta = fresh_res.demand_fulfillment_pct - base_res.demand_fulfillment_pct
+
+fresh_accepted_kg = sum(a.sold_qty_kg for a in fresh_res.allocations)
+base_accepted_kg = sum(a.sold_qty_kg for a in base_res.allocations)
+vol_delta = fresh_accepted_kg - base_accepted_kg
+
+st.markdown("### Operational and Financial Overview")
+
+row1_col1, row1_col2 = st.columns(2)
+with row1_col1:
+    render_metric_card(
+        title="Net Profit",
+        main_val=format_inr(fresh_res.net_profit),
+        vs_val=format_inr(base_res.net_profit),
+        delta_text=(
+            f"+{format_inr(profit_gain)} ({profit_pct:+.1f}%)"
+            if profit_gain >= 0
+            else f"-{format_inr(abs(profit_gain))} ({profit_pct:.1f}%)"
+        ),
+        is_positive=profit_gain >= 0,
+        arrow="\u2191" if profit_gain >= 0 else "\u2193",
+    )
+
+with row1_col2:
+    render_metric_card(
+        title="Spoilage Rate",
+        main_val=f"{fresh_res.spoilage_rate_pct}%",
+        vs_val=f"{base_res.spoilage_rate_pct}%",
+        delta_text=(
+            f"{abs(spoilage_delta):.2f}% pts reduction"
+            if spoilage_delta <= 0
+            else f"{spoilage_delta:+.2f}% pts increase"
+        ),
+        is_positive=spoilage_delta <= 0,
+        arrow="\u2193" if spoilage_delta <= 0 else "\u2191",
+    )
+
+row2_col1, row2_col2 = st.columns(2)
+with row2_col1:
+    render_metric_card(
+        title="Demand Fulfillment",
+        main_val=f"{fresh_res.demand_fulfillment_pct}%",
+        vs_val=f"{base_res.demand_fulfillment_pct:.2f}%",
+        delta_text=f"{fulfill_delta:+.2f}% points",
+        is_positive=fulfill_delta >= 0,
+        arrow="\u2191" if fulfill_delta >= 0 else "\u2193",
+    )
+
+with row2_col2:
+    render_metric_card(
+        title="Usable Volume Cleared",
+        main_val=f"{format_inr(fresh_accepted_kg, prefix='', decimals=0)} kg",
+        vs_val=f"{format_inr(base_accepted_kg, prefix='', decimals=0)} kg",
+        delta_text=(
+            f"+{format_inr(vol_delta, prefix='', decimals=0)} kg"
+            if vol_delta >= 0
+            else f"-{format_inr(abs(vol_delta), prefix='', decimals=0)} kg"
+        ),
+        is_positive=vol_delta >= 0,
+        arrow="\u2191" if vol_delta >= 0 else "\u2193",
+    )
+
+st.markdown("---")
+
+tab1, tab2, tab3, tab4 = st.tabs(
+    [
+        "Side-by-Side Comparison",
+        "Detailed Dispatch Plan & Audit",
+        "Uncertainty & Risk Analysis",
+        "Inventory Batches",
+    ]
+)
+
+with tab1:
+    vcol1, vcol2 = st.columns(2)
+
+    financial_df = pd.DataFrame(
+        {
+            "Category": [
+                "Gross Revenue",
+                "Logistics Cost",
+                "Procurement Cost",
+                "Spoilage Penalties",
+                "Net Profit",
+            ],
+            "Baseline (FIFO)": [
+                base_res.total_gross_revenue,
+                base_res.total_transport_cost,
+                base_res.total_procurement_cost,
+                base_res.disposal_waste_cost,
+                base_res.net_profit,
+            ],
+            "FreshRoute": [
+                fresh_res.total_gross_revenue,
+                fresh_res.total_transport_cost,
+                fresh_res.total_procurement_cost,
+                fresh_res.disposal_waste_cost,
+                fresh_res.net_profit,
+            ],
+        }
+    )
+
+    # Colorblind-safe palette (Slate vs Sky Blue) + geometric pattern fills for accessibility
+    fig_fin = go.Figure(
+        data=[
+            go.Bar(
+                name="Baseline (FIFO)",
+                x=financial_df["Category"],
+                y=financial_df["Baseline (FIFO)"],
+                marker_color="#64748b",
+                marker_pattern_shape="/",
+            ),
+            go.Bar(
+                name="FreshRoute",
+                x=financial_df["Category"],
+                y=financial_df["FreshRoute"],
+                marker_color="#0284c7",
+            ),
+        ]
+    )
+    fig_fin.update_layout(
+        title="Financial Comparison (INR)",
+        barmode="group",
+        legend_title_text="Strategy",
+    )
+    vcol1.plotly_chart(fig_fin, use_container_width=True)
+
+    fig_metrics = go.Figure(
+        data=[
+            go.Bar(
+                name="Baseline (FIFO)",
+                x=["Spoilage %", "Fulfillment %"],
+                y=[base_res.spoilage_rate_pct, base_res.demand_fulfillment_pct],
+                marker_color="#d97706",
+                marker_pattern_shape="x",
+            ),
+            go.Bar(
+                name="FreshRoute",
+                x=["Spoilage %", "Fulfillment %"],
+                y=[fresh_res.spoilage_rate_pct, fresh_res.demand_fulfillment_pct],
+                marker_color="#0284c7",
+            ),
+        ]
+    )
+    fig_metrics.update_layout(
+        title="Operational Efficiency Comparison (%)",
+        barmode="group",
+        legend_title_text="Strategy",
+    )
+    vcol2.plotly_chart(fig_metrics, use_container_width=True)
+
+    insights = DecisionExplainer.explain_comparison(base_res, fresh_res)
+    st.info(
+        f"Audit Summary ({fresh_res.solve_time_ms:.2f} ms execution): {insights['Key Driver']}"
+    )
+
+with tab2:
+    st.subheader("Traceable Dispatch Plan with Dynamic Discounting")
+    audit_table = DecisionExplainer.generate_audit_table(fresh_res.allocations)
+    st.dataframe(audit_table, use_container_width=True)
+
+    safe_export_df = DecisionExplainer.generate_audit_table(
+        fresh_res.allocations, sanitize_for_export=True
+    )
+    csv_data = safe_export_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Export Evidence-Backed Distribution Plan (CSV)",
+        data=csv_data,
+        file_name="freshroute_distribution_plan.csv",
+        mime="text/csv",
+    )
+
+with tab3:
+    st.subheader("Monte Carlo Sensitivity Analysis (\u00b110% Shelf-Life/Demand, \u00b115% Transit Uncertainty)")
+    ucol1, ucol2, ucol3 = st.columns(3)
+    ucol1.metric("Expected Net Profit (Mean)", format_inr(mc_report.mean_net_profit))
+    ucol2.metric("5th Percentile (Downside Risk)", format_inr(mc_report.p5_net_profit))
+    ucol3.metric("95th Percentile (Upside Case)", format_inr(mc_report.p95_net_profit))
+    st.caption(
+        f"Evaluated across {mc_report.runs} stochastic scenarios: "
+        f"Mean Spoilage = {mc_report.mean_spoilage_pct:.2f}%, "
+        f"Mean Fulfillment = {mc_report.mean_fulfillment_pct:.2f}%, "
+        f"Profit Std Dev = {format_inr(mc_report.std_net_profit)}."
+    )
+
+with tab4:
+    st.subheader("Current Warehouse Inventory Batches (Nashik Central Hub)")
+    st.dataframe(batch_df, use_container_width=True)
+
+
+==================================================
+FILE: .\pytest.ini
+==================================================
+[pytest]
+pythonpath = .
+testpaths = tests
+
+
+==================================================
+FILE: .\README.md
+==================================================
+# FreshRoute: Intelligent Decision Support for Perishable Produce Distribution
+
+> Problem Statement PS 07 â€” Bugged Out! 8-Hour Buildathon | IEEE RAS VITC & VIT Chennai Office of Students' Welfare  
+> Domain: Post-Harvest Supply Chain Optimization & Agri-Tech Decision Support  
+> Target Alignment: India Ministry of Food Processing Industries (MoFPI) Post-Harvest Loss Mitigation
+
+---
+
+## 1. Executive Summary & Problem Context
+
+India's Ministry of Food Processing Industries (MoFPI) reported severe post-harvest losses across 54 commodities in 15 agro-climatic zones, with fruits and vegetables suffering 15% to 25% waste between farm gates and retail markets. 
+
+Traditional agricultural distributors rely on naive FIFO (First-In, First-Out) dispatching the oldest inventory to the first available destination order. This causes three critical supply chain failures:
+1. In-Transit & Dock Spoilage: Batches with short shelf life are sent on long transit corridors and arrive with insufficient commercial shelf life (< 6.0h), causing retailers to reject and dump consignments at the loading dock.
+2. Suboptimal Revenue Realization: High-perishability produce is dumped into low-price local markets instead of high-margin transit corridors.
+3. Binary Pricing (Spoil or Sell): Produce is priced at 100% until it spoils, instead of applying dynamic clearance discounting to salvage near-expiry batches.
+
+FreshRoute is a constrained decision-support engine that unifies remaining shelf-life estimates, transport matrices, dynamic pricing, and destination demand to produce a mathematically optimal, 100% explainable, and zero-in-transit-spoilage dispatch schedule.
+
+---
+
+## 2. Verified Benchmark Evaluation
+
+Evaluated on the Maharashtra-Gujarat Agricultural Corridor (Nashik Central Hub distributing Tomatoes, Leafy Greens/Spinach, Alphonso Mangoes, and Onions across Mumbai, Pune, Surat, and Goa).
+
+### Benchmark 1: Normal Operating Conditions
+| Metric | Baseline (Naive FIFO) | FreshRoute Intelligent | Performance Delta |
+| :--- | :---: | :---: | :---: |
+| Total Inventory | 27,800 kg | 27,800 kg | â€” |
+| Dispatched Quantity | 27,800 kg | 27,800 kg | â€” |
+| Demand Fulfillment (%) | 74.68% | 89.10% | +14.4% points |
+| Spoilage Loss (kg) | 4,500 kg | 0 kg | -100% Spoilage |
+| Spoilage Rate (%) | 16.19% | 0.00% | -16.19% points |
+| Gross Realized Revenue | â‚¹10,67,400.00 | â‚¹12,36,807.00 | +â‚¹1,69,407.00 (+15.9%) |
+| Logistics & Freight Cost | â‚¹81,110.00 | â‚¹92,210.00 | Route optimization trade-off |
+| Spoilage Penalties | â‚¹22,500.00 | â‚¹0.00 | Saved â‚¹22,500.00 |
+| NET PROFIT | â‚¹3,21,690.00 (3.21 L) | â‚¹5,02,497.00 (5.02 L) | +â‚¹1,80,807.00 (+56.2%) |
+
+---
+
+### Benchmark 2: Robustness Stress-Test (Monsoon Disruption)
+Scenario: Simulated Monsoon Highway Blockade (+6.0h Transit Delays across all corridors) + Market Demand Shock (-30% drop).
+
+| Stress Metric under Severe Shock | Baseline (Naive FIFO) | FreshRoute Resilient | Performance Delta |
+| :--- | :---: | :---: | :---: |
+| Spoiled Produce (kg) | 6,550 kg | 4,500 kg | 2,050 kg saved from dump |
+| Spoilage Rate (%) | 23.56% | 16.19% | -7.37% points lower waste |
+| NET PROFIT PRESERVED | â‚¹1,68,525.00 (1.68 L) | â‚¹3,31,568.00 (3.31 L) | +â‚¹1,63,043.00 (+96.7%) |
+
+---
+
+## 3. Core Technical Architecture
+
+FreshRoute is engineered across three decoupled layers:
+
+```
+[ Raw Inputs: Batches, Mandi Demands, Routes ]
+                       |
+                       v
++-------------------------------------------------------------+
+| 1. Constraint & Feasibility Layer (models.py)               |
+|    - Hard Bounds: S_i >= T_ij + H_j + Buffer (2.0h)         |
+|    - Transport Vehicle Capacity & Mandi Demand Caps         |
++-------------------------------------------------------------+
+                       |
+                       v
++-------------------------------------------------------------+
+| 2. Intelligent Optimization Engine (freshroute_solver.py)   |
+|    - Multi-Objective Priority Index (Margin x Urgency)      |
+|    - Dynamic Salvage Discounting (0% - 25% Decay Curve)     |
++-------------------------------------------------------------+
+                       |
+                       v
++-------------------------------------------------------------+
+| 3. Audit & Explainability Layer (explainability.py)         |
+|    - Line-item trace: Base cost, Freight, Net Margin/kg     |
+|    - Evidence-backed reasoning for every single kilogram    |
++-------------------------------------------------------------+
+                       |
+         +-------------+-------------+
+         v                           v
+[ CLI Benchmark (run_demo.py) ]  [ Interactive Dashboard (app.py) ]
+```
+
+### Key Engineering Safeguards:
+1. Zero In-Transit Spoilage Guarantee: Enforces strict inequality S_i >= T_ij + H_j + safe_buffer, where S_i is batch shelf life, T_ij is route transit time, H_j is destination handling time, and safe_buffer is 2.0h minimum arrival buffer.
+2. Targeted Dynamic Clearance Discounting: When arrival buffer is between 2h and 12h, the engine dynamically applies a calibrated clearance discount (up to 25%) to ensure immediate mandi turnover and prevent commercial rejection.
+3. Traceable Decision Audit: Every dispatch includes a transparent mathematical proof showing gross revenue, freight cost per kg, applied discount, and exact business justification.
+
+---
+
+## 4. Repository Structure
+
+```
+freshroute/
+|-- README.md                  # Documentation and verified benchmark metrics
+|-- pytest.ini                 # Pytest root configuration
+|-- requirements.txt           # Deterministic Python dependencies
+|-- run_demo.py                # 1-Command CLI benchmark evaluator (Indian numbering)
+|-- app.py                     # Streamlit executive dashboard & interactive simulator
+|-- engine/
+|   |-- __init__.py
+|   |-- models.py              # Pydantic data schemas & constraint validations
+|   |-- baseline_solver.py     # Naive FIFO baseline with commercial dock inspection
+|   |-- freshroute_solver.py   # Multi-objective optimization & dynamic discounting
+|   |-- explainability.py      # Line-by-line financial audit & narrative generator
+|   `-- data_generator.py      # Indian agro-corridor datasets & disruption simulator
+`-- tests/
+    `-- test_freshroute.py     # Pytest verification suite (4/4 passed)
+```
+
+---
+
+## 5. Quickstart & Reproducibility Guide
+
+### Step 1: Set Up Virtual Environment
+
+Windows (PowerShell):
+```powershell
+py -3.12 -m venv .venv
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+```
+
+Linux / macOS:
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+```
+
+### Step 2: Install Dependencies
+```bash
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+---
+
+## 6. Verification Commands
+
+### 1. Run the Terminal Benchmark
+Executes side-by-side comparison tables against the baseline under normal and disrupted conditions:
+```bash
+python run_demo.py
+```
+
+### 2. Run the Automated Test Suite
+Verifies that all constraints and arrival buffers are respected:
+```bash
+pytest tests/test_freshroute.py -v
+```
+
+### 3. Launch the Interactive Dashboard
+Opens the Streamlit control panel with interactive policy sliders, disruption toggles, and CSV export:
+```bash
+streamlit run app.py
+```
+
+---
+
+## 7. Sample Traceable Audit Record
+
+Excerpt from the automated dispatch table generated by explainability.py:
+
+| Batch ID | Commodity | Destination | Quantity (kg) | Buffer at Arrival | Discount % | Net Margin (â‚¹/kg) |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| B-MNG-01 | Mango | Goa Supermarkets (DEST-GOA-M) | 1,500.0 | 56.0 h | 0% | â‚¹72.50 / kg |
+| B-MNG-01 | Mango | Mumbai Export (DEST-MUM-M) | 500.0 | 64.0 h | 0% | â‚¹56.00 / kg |
+| B-MNG-02 | Mango | Mumbai Export (DEST-MUM-M) | 1,800.0 | 40.0 h | 0% | â‚¹54.00 / kg |
+| B-TOM-02 | Tomato | Goa Hospitality (DEST-GOA-T) | 2,000.0 | 20.0 h | 0% | â‚¹19.00 / kg |
+| B-SPN-01 | Spinach | Mumbai Retail Hub (DEST-MUM-S) | 1,500.0 | 8.0 h | 8% | â‚¹16.40 / kg |
+
+---
+
+## 8. Real-World Relevance & Commercial Model
+
+* Target Users: Agricultural Produce Distributors, Farmer Producer Organizations (FPOs), APMC Commission Agents, Cold-Storage Hub Operators.
+* Commercial Model: SaaS decision-support subscription for wholesale agri-distributors and 3PL cold-chain operators.
+* Economic Value: Reduces post-harvest losses by >16%, increases distributor net margins by over 56%, and preserves grower capital during road disruptions.
+
+
+==================================================
+FILE: .\requirements.txt
+==================================================
+streamlit>=1.30.0
+pandas>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+pydantic>=2.0.0
+plotly>=5.18.0
+tabulate>=0.9.0
+pytest>=7.4.0
+
+
+==================================================
+FILE: .\run_demo.py
+==================================================
+"""run_demo.py: One-command benchmark evaluator with Indian Numbering System and accessible CLI modes."""
+
+import argparse
+import io
+import sys
+from tabulate import tabulate
+
+from engine.baseline_solver import BaselineSolver
+from engine.data_generator import apply_disruption, get_standard_scenario
+from engine.explainability import DecisionExplainer, format_inr
+from engine.freshroute_solver import FreshRouteSolver
+
+
+def configure_utf8_output() -> None:
+    """Ensures Windows PowerShell/CMD terminals render UTF-8 symbols without mojibake."""
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except ValueError:
+            pass
+
+
+def run_benchmark(ascii_mode: bool = False) -> None:
+    configure_utf8_output()
+    currency = "INR " if ascii_mode else "\u20b9"
+    bullet = "*" if ascii_mode else "\u2022"
+    table_style = "grid" if ascii_mode else "fancy_grid"
+
+    print("=" * 80)
+    print("  FRESHROUTE: PERISHABLE PRODUCE DECISION-SUPPORT BENCHMARK")
+    print("=" * 80)
+
+    batches, dests, routes = get_standard_scenario()
+
+    baseline_solver = BaselineSolver()
+    fresh_solver = FreshRouteSolver()
+
+    base_res = baseline_solver.solve(batches, dests, routes)
+    fresh_res = fresh_solver.solve(batches, dests, routes)
+
+    comparison_data = [
+        [
+            "Total Inventory (kg)",
+            format_inr(base_res.total_inventory_kg, prefix="", decimals=0),
+            format_inr(fresh_res.total_inventory_kg, prefix="", decimals=0),
+        ],
+        [
+            "Dispatched Quantity (kg)",
+            format_inr(base_res.dispatched_kg, prefix="", decimals=0),
+            format_inr(fresh_res.dispatched_kg, prefix="", decimals=0),
+        ],
+        [
+            "Demand Fulfillment (%)",
+            f"{base_res.demand_fulfillment_pct}%",
+            f"{fresh_res.demand_fulfillment_pct}%",
+        ],
+        [
+            "Spoilage Loss (kg)",
+            format_inr(base_res.spoiled_kg, prefix="", decimals=0),
+            format_inr(fresh_res.spoiled_kg, prefix="", decimals=0),
+        ],
+        [
+            "Spoilage Rate (%)",
+            f"{base_res.spoilage_rate_pct}%",
+            f"{fresh_res.spoilage_rate_pct}%",
+        ],
+        [
+            "Gross Revenue",
+            format_inr(base_res.total_gross_revenue, prefix=currency, decimals=2),
+            format_inr(fresh_res.total_gross_revenue, prefix=currency, decimals=2),
+        ],
+        [
+            "Logistics Cost",
+            format_inr(base_res.total_transport_cost, prefix=currency, decimals=2),
+            format_inr(fresh_res.total_transport_cost, prefix=currency, decimals=2),
+        ],
+        [
+            "Spoilage Penalties",
+            format_inr(base_res.disposal_waste_cost, prefix=currency, decimals=2),
+            format_inr(fresh_res.disposal_waste_cost, prefix=currency, decimals=2),
+        ],
+        [
+            "NET PROFIT",
+            format_inr(base_res.net_profit, prefix=currency, decimals=2),
+            format_inr(fresh_res.net_profit, prefix=currency, decimals=2),
+        ],
+        [
+            "Solve Time (ms)",
+            f"{base_res.solve_time_ms:.3f} ms",
+            f"{fresh_res.solve_time_ms:.3f} ms",
+        ],
+    ]
+
+    print("\n[SCENARIO 1: NORMAL CONDITIONS - NASHIK CORRIDOR]")
+    print(
+        tabulate(
+            comparison_data,
+            headers=["Metric", "Baseline (Naive FIFO)", "FreshRoute Intelligent"],
+            tablefmt=table_style,
+        )
+    )
+
+    profit_diff = fresh_res.net_profit - base_res.net_profit
+    pct_gain = (profit_diff / max(abs(base_res.net_profit), 1.0)) * 100.0
+
+    print("\n--- PERFORMANCE HIGHLIGHTS ---")
+    print(f"{bullet} Profit Delta: +{format_inr(profit_diff, prefix=currency, decimals=2)} (+{pct_gain:.1f}%)")
+    print(
+        f"{bullet} Spoilage Reduction: "
+        f"+{base_res.spoilage_rate_pct - fresh_res.spoilage_rate_pct:.2f}% points lower spoilage"
+    )
+    print(
+        f"{bullet} Fulfillment Delta: "
+        f"+{fresh_res.demand_fulfillment_pct - base_res.demand_fulfillment_pct:.2f}% points higher demand fulfillment"
+    )
+    print(
+        f"{bullet} Key Driver: FreshRoute eliminated in-transit spoilage via arrival buffer enforcement "
+        "and liquidated tight-buffer produce via targeted dynamic discounting."
+    )
+
+    # Stress Test
+    print("\n" + "=" * 80)
+    print("  STRESS TEST: MONSOON DELAY (+6h Highway Blockade, -30% Demand Shock)")
+    print("=" * 80)
+
+    dis_routes, dis_dests = apply_disruption(routes, dests, delay_hours=6.0, demand_shock_pct=-0.30)
+    base_dis = baseline_solver.solve(batches, dis_dests, dis_routes)
+    fresh_dis = fresh_solver.solve(batches, dis_dests, dis_routes)
+
+    stress_data = [
+        [
+            "Spoilage Loss (kg)",
+            format_inr(base_dis.spoiled_kg, prefix="", decimals=0),
+            format_inr(fresh_dis.spoiled_kg, prefix="", decimals=0),
+        ],
+        [
+            "Spoilage Rate (%)",
+            f"{base_dis.spoilage_rate_pct}%",
+            f"{fresh_dis.spoilage_rate_pct}%",
+        ],
+        [
+            "NET PROFIT",
+            format_inr(base_dis.net_profit, prefix=currency, decimals=2),
+            format_inr(fresh_dis.net_profit, prefix=currency, decimals=2),
+        ],
+    ]
+    print(
+        tabulate(
+            stress_data,
+            headers=["Stress Metric", "Baseline (Naive FIFO)", "FreshRoute Resilient"],
+            tablefmt=table_style,
+        )
+    )
+
+    # Monte Carlo Uncertainty Report
+    mc_report = fresh_solver.evaluate_uncertainty(batches, dests, routes, runs=30)
+    print("\n[MONTE CARLO UNCERTAINTY ANALYSIS (30 STOCHASTIC RUNS)]")
+    print(
+        f"{bullet} Expected Profit: {format_inr(mc_report.mean_net_profit, prefix=currency, decimals=2)} "
+        f"(5th-95th Percentile: {format_inr(mc_report.p5_net_profit, prefix=currency, decimals=0)} to "
+        f"{format_inr(mc_report.p95_net_profit, prefix=currency, decimals=0)})"
+    )
+
+    print("\n[SAMPLE AUDIT TRAIL - FIRST 5 ALLOCATIONS]")
+    audit_df = DecisionExplainer.generate_audit_table(fresh_res.allocations)
+    margin_col = "Net Margin (\u20b9/kg)"
+    print(
+        audit_df[
+            [
+                "Batch",
+                "Commodity",
+                "Destination",
+                "Quantity (kg)",
+                "Buffer Upon Arrival (h)",
+                "Discount %",
+                margin_col,
+            ]
+        ]
+        .head(5)
+        .to_string(index=False)
+    )
+    print("\nBenchmark completed successfully.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="FreshRoute CLI Benchmark Runner")
+    parser.add_argument(
+        "--ascii",
+        action="store_true",
+        help="Use ASCII-only output for screen readers and legacy terminal environments.",
+    )
+    args = parser.parse_args()
+    run_benchmark(ascii_mode=args.ascii)
+
+
+==================================================
+FILE: .\engine\baseline_solver.py
+==================================================
+"""engine/baseline_solver.py: Realistic Naive FIFO Dispatcher with O(B + D) pre-indexed lookup."""
+
+from collections import defaultdict
+import time
+from typing import Dict, List
+
+from .models import (
+    AllocationDecision,
+    Batch,
+    Destination,
+    OptimizationSummary,
+    TransportRoute,
+)
+
+
+class BaselineSolver:
+    """
+    Standard naive baseline:
+    - Dispatches oldest batches first (FIFO) to fulfill orders in order of destination appearance.
+    - Zero dynamic discounting.
+    - Retail dock inspection: Shipments arriving with < 6.0h shelf-life buffer without clearance
+      discounting fail commercial inspection and are rejected at the dock as spoiled.
+    """
+
+    def __init__(self, min_retail_buffer_hrs: float = 6.0, spoilage_penalty_per_kg: float = 5.0):
+        if min_retail_buffer_hrs < 0:
+            raise ValueError("min_retail_buffer_hrs must be non-negative.")
+        if spoilage_penalty_per_kg < 0:
+            raise ValueError("spoilage_penalty_per_kg must be non-negative.")
+        self.min_retail_buffer_hrs = min_retail_buffer_hrs
+        self.spoilage_penalty_per_kg = spoilage_penalty_per_kg
+
+    def solve(
+        self,
+        batches: List[Batch],
+        destinations: List[Destination],
+        routes: List[TransportRoute],
+    ) -> OptimizationSummary:
+        start_ns = time.perf_counter_ns()
+
+        route_map = {(r.origin, r.dest_id): r for r in routes}
+        remaining_demand = {d.dest_id: d.demand_kg for d in destinations}
+        total_inventory_kg = sum(b.quantity_kg for b in batches)
+
+        # Pre-index destinations by commodity for O(1) lookup instead of O(B * D) filtering
+        dests_by_commodity: Dict[str, List[Destination]] = defaultdict(list)
+        for d in destinations:
+            dests_by_commodity[d.commodity].append(d)
+
+        # FIFO: oldest batches dispatched first
+        sorted_batches = sorted(batches, key=lambda b: b.remaining_shelf_life_hrs)
+        allocations: List[AllocationDecision] = []
+        dispatched_kg = 0.0
+        spoiled_kg = 0.0
+
+        for batch in sorted_batches:
+            batch_qty = batch.quantity_kg
+            candidate_dests = dests_by_commodity.get(batch.commodity, [])
+
+            for dest in candidate_dests:
+                if batch_qty <= 0:
+                    break
+
+                avail_demand = remaining_demand[dest.dest_id]
+                if avail_demand <= 0:
+                    continue
+
+                route = route_map.get((batch.origin, dest.dest_id))
+                if not route:
+                    continue
+
+                alloc_qty = min(batch_qty, avail_demand)
+                if alloc_qty <= 0:
+                    continue
+
+                travel_time = route.travel_time_hrs
+                total_time_to_shelf = travel_time + dest.handling_time_hrs
+                buffer = batch.remaining_shelf_life_hrs - total_time_to_shelf
+
+                discount = 0.0
+                final_price = dest.selling_price_per_kg
+
+                if buffer < self.min_retail_buffer_hrs:
+                    spoiled_kg += alloc_qty
+                    sold_qty = 0.0
+                    clearance_rate = 0.0
+                    reason = (
+                        f"REJECTED/SPOILED: Arrived with insufficient buffer "
+                        f"({buffer:.1f}h < {self.min_retail_buffer_hrs}h contracted window)."
+                    )
+                    gross_rev = 0.0
+                else:
+                    sold_qty = alloc_qty
+                    clearance_rate = 1.0
+                    gross_rev = alloc_qty * final_price
+                    reason = f"Dispatched via naive FIFO to {dest.name}."
+
+                t_cost = alloc_qty * route.cost_per_kg
+                p_cost = alloc_qty * batch.base_cost_per_kg
+                net = gross_rev - t_cost - p_cost
+
+                allocations.append(
+                    AllocationDecision(
+                        batch_id=batch.batch_id,
+                        dest_id=dest.dest_id,
+                        commodity=batch.commodity,
+                        quantity_kg=alloc_qty,
+                        sold_qty_kg=sold_qty,
+                        clearance_rate=clearance_rate,
+                        travel_time_hrs=travel_time,
+                        remaining_shelf_life_hrs=batch.remaining_shelf_life_hrs,
+                        shelf_life_buffer_hrs=round(buffer, 1),
+                        base_price_per_kg=dest.selling_price_per_kg,
+                        discount_pct=discount,
+                        final_price_per_kg=final_price,
+                        transport_cost_per_kg=route.cost_per_kg,
+                        base_cost_per_kg=batch.base_cost_per_kg,
+                        gross_revenue=round(gross_rev, 2),
+                        transport_cost_total=round(t_cost, 2),
+                        procurement_cost_total=round(p_cost, 2),
+                        net_profit=round(net, 2),
+                        reason=reason,
+                    )
+                )
+
+                remaining_demand[dest.dest_id] -= alloc_qty
+                batch_qty -= alloc_qty
+                dispatched_kg += alloc_qty
+
+            if batch_qty > 0 and batch.remaining_shelf_life_hrs <= 24.0:
+                spoiled_kg += batch_qty
+
+        unsold_unspoiled = max(0.0, total_inventory_kg - dispatched_kg)
+        tot_gross = sum(a.gross_revenue for a in allocations)
+        tot_trans = sum(a.transport_cost_total for a in allocations)
+        tot_proc = sum(a.procurement_cost_total for a in allocations)
+        waste_penalty = spoiled_kg * self.spoilage_penalty_per_kg
+        net_profit = tot_gross - tot_trans - tot_proc - waste_penalty
+
+        total_demand = sum(d.demand_kg for d in destinations)
+        fulfilled = sum(a.sold_qty_kg for a in allocations)
+        fulfillment_pct = (fulfilled / total_demand * 100.0) if total_demand > 0 else 0.0
+        spoilage_pct = (spoiled_kg / total_inventory_kg * 100.0) if total_inventory_kg > 0 else 0.0
+        elapsed_ms = (time.perf_counter_ns() - start_ns) / 1_000_000.0
+
+        return OptimizationSummary(
+            strategy_name="Baseline (Naive FIFO)",
+            total_inventory_kg=total_inventory_kg,
+            dispatched_kg=dispatched_kg,
+            spoiled_kg=round(spoiled_kg, 1),
+            unsold_unspoiled_kg=round(unsold_unspoiled, 1),
+            spoilage_rate_pct=round(spoilage_pct, 2),
+            demand_fulfillment_pct=round(fulfillment_pct, 2),
+            total_gross_revenue=round(tot_gross, 2),
+            total_transport_cost=round(tot_trans, 2),
+            total_procurement_cost=round(tot_proc, 2),
+            disposal_waste_cost=round(waste_penalty, 2),
+            net_profit=round(net_profit, 2),
+            solve_time_ms=round(elapsed_ms, 3),
+            allocations=allocations,
+        )
+
+
+==================================================
+FILE: .\engine\data_generator.py
+==================================================
+"""engine/data_generator.py: Dataset generator, cold-chain telemetry, and disruption scenarios."""
+
+from typing import List, Tuple
+from .models import Batch, Destination, TransportRoute
+
+
+def get_standard_scenario() -> Tuple[List[Batch], List[Destination], List[TransportRoute]]:
+    """Standard Indian agricultural corridor scenario: Nashik Hub to Mumbai, Pune, Surat, and Goa."""
+    origin = "Hub-Nashik"
+
+    batches = [
+        # Highly perishable: Tomatoes
+        Batch(
+            batch_id="B-TOM-01",
+            commodity="Tomato",
+            quantity_kg=3000,
+            remaining_shelf_life_hrs=18.0,
+            base_cost_per_kg=15.0,
+            origin=origin,
+            storage_temp_c=4.0,
+        ),
+        Batch(
+            batch_id="B-TOM-02",
+            commodity="Tomato",
+            quantity_kg=4000,
+            remaining_shelf_life_hrs=36.0,
+            base_cost_per_kg=14.0,
+            origin=origin,
+            storage_temp_c=4.0,
+        ),
+        Batch(
+            batch_id="B-TOM-03",
+            commodity="Tomato",
+            quantity_kg=2500,
+            remaining_shelf_life_hrs=10.0,
+            base_cost_per_kg=15.0,
+            origin=origin,
+            storage_temp_c=4.0,
+        ),
+        # Ultra perishable: Spinach / Leafy Greens
+        Batch(
+            batch_id="B-SPN-01",
+            commodity="Spinach",
+            quantity_kg=1500,
+            remaining_shelf_life_hrs=14.0,
+            base_cost_per_kg=22.0,
+            origin=origin,
+            storage_temp_c=4.0,
+        ),
+        Batch(
+            batch_id="B-SPN-02",
+            commodity="Spinach",
+            quantity_kg=2000,
+            remaining_shelf_life_hrs=8.0,
+            base_cost_per_kg=22.0,
+            origin=origin,
+            storage_temp_c=4.0,
+        ),
+        # Medium perishable: Mangoes (Alphonso)
+        Batch(
+            batch_id="B-MNG-01",
+            commodity="Mango",
+            quantity_kg=2000,
+            remaining_shelf_life_hrs=72.0,
+            base_cost_per_kg=60.0,
+            origin=origin,
+            storage_temp_c=4.0,
+        ),
+        Batch(
+            batch_id="B-MNG-02",
+            commodity="Mango",
+            quantity_kg=1800,
+            remaining_shelf_life_hrs=48.0,
+            base_cost_per_kg=62.0,
+            origin=origin,
+            storage_temp_c=4.0,
+        ),
+        # Storable: Onions
+        Batch(
+            batch_id="B-ONI-01",
+            commodity="Onion",
+            quantity_kg=5000,
+            remaining_shelf_life_hrs=240.0,
+            base_cost_per_kg=18.0,
+            origin=origin,
+            storage_temp_c=4.0,
+        ),
+        Batch(
+            batch_id="B-ONI-02",
+            commodity="Onion",
+            quantity_kg=6000,
+            remaining_shelf_life_hrs=180.0,
+            base_cost_per_kg=17.5,
+            origin=origin,
+            storage_temp_c=4.0,
+        ),
+    ]
+
+    destinations = [
+        # Mumbai APMC Mandi (Close, high demand, medium price)
+        Destination(
+            dest_id="DEST-MUM",
+            name="Mumbai Vashi Mandi",
+            commodity="Tomato",
+            demand_kg=4000,
+            selling_price_per_kg=32.0,
+            handling_time_hrs=2.0,
+        ),
+        Destination(
+            dest_id="DEST-MUM-S",
+            name="Mumbai Retail Hub",
+            commodity="Spinach",
+            demand_kg=2200,
+            selling_price_per_kg=45.0,
+            handling_time_hrs=1.5,
+        ),
+        Destination(
+            dest_id="DEST-MUM-M",
+            name="Mumbai Export Term",
+            commodity="Mango",
+            demand_kg=2500,
+            selling_price_per_kg=120.0,
+            handling_time_hrs=3.0,
+        ),
+        Destination(
+            dest_id="DEST-MUM-O",
+            name="Mumbai Wholesale",
+            commodity="Onion",
+            demand_kg=6000,
+            selling_price_per_kg=28.0,
+            handling_time_hrs=2.0,
+        ),
+        # Pune Regional Market (Very close, lower price)
+        Destination(
+            dest_id="DEST-PUN",
+            name="Pune Gultekdi Mandi",
+            commodity="Tomato",
+            demand_kg=3500,
+            selling_price_per_kg=26.0,
+            handling_time_hrs=1.5,
+        ),
+        Destination(
+            dest_id="DEST-PUN-S",
+            name="Pune Local Markets",
+            commodity="Spinach",
+            demand_kg=1500,
+            selling_price_per_kg=38.0,
+            handling_time_hrs=1.0,
+        ),
+        # Surat Commercial Center (Medium distance, high tomato prices)
+        Destination(
+            dest_id="DEST-SUR",
+            name="Surat Agro Market",
+            commodity="Tomato",
+            demand_kg=3000,
+            selling_price_per_kg=35.0,
+            handling_time_hrs=2.5,
+        ),
+        Destination(
+            dest_id="DEST-SUR-O",
+            name="Surat Wholesale",
+            commodity="Onion",
+            demand_kg=5000,
+            selling_price_per_kg=30.0,
+            handling_time_hrs=2.0,
+        ),
+        # Goa Premium Coastal Market (Far, high prices for mango & vegetables)
+        Destination(
+            dest_id="DEST-GOA-M",
+            name="Goa Supermarkets",
+            commodity="Mango",
+            demand_kg=1500,
+            selling_price_per_kg=140.0,
+            handling_time_hrs=2.0,
+        ),
+        Destination(
+            dest_id="DEST-GOA-T",
+            name="Goa Hospitality Hub",
+            commodity="Tomato",
+            demand_kg=2000,
+            selling_price_per_kg=40.0,
+            handling_time_hrs=2.0,
+        ),
+    ]
+
+    routes = [
+        # To Mumbai
+        TransportRoute(
+            origin=origin, dest_id="DEST-MUM", travel_time_hrs=4.5, cost_per_kg=2.5, vehicle_capacity_kg=8000
+        ),
+        TransportRoute(
+            origin=origin, dest_id="DEST-MUM-S", travel_time_hrs=4.5, cost_per_kg=3.0, vehicle_capacity_kg=4000
+        ),
+        TransportRoute(
+            origin=origin, dest_id="DEST-MUM-M", travel_time_hrs=5.0, cost_per_kg=4.0, vehicle_capacity_kg=5000
+        ),
+        TransportRoute(
+            origin=origin, dest_id="DEST-MUM-O", travel_time_hrs=4.5, cost_per_kg=2.0, vehicle_capacity_kg=10000
+        ),
+        # To Pune
+        TransportRoute(
+            origin=origin, dest_id="DEST-PUN", travel_time_hrs=3.0, cost_per_kg=1.8, vehicle_capacity_kg=7000
+        ),
+        TransportRoute(
+            origin=origin, dest_id="DEST-PUN-S", travel_time_hrs=3.0, cost_per_kg=2.2, vehicle_capacity_kg=3000
+        ),
+        # To Surat
+        TransportRoute(
+            origin=origin, dest_id="DEST-SUR", travel_time_hrs=7.0, cost_per_kg=3.8, vehicle_capacity_kg=6000
+        ),
+        TransportRoute(
+            origin=origin, dest_id="DEST-SUR-O", travel_time_hrs=7.0, cost_per_kg=3.2, vehicle_capacity_kg=8000
+        ),
+        # To Goa (Long haul: 14 hrs transit)
+        TransportRoute(
+            origin=origin, dest_id="DEST-GOA-M", travel_time_hrs=14.0, cost_per_kg=7.5, vehicle_capacity_kg=4000
+        ),
+        TransportRoute(
+            origin=origin, dest_id="DEST-GOA-T", travel_time_hrs=14.0, cost_per_kg=7.0, vehicle_capacity_kg=4000
+        ),
+    ]
+
+    return batches, destinations, routes
+
+
+def apply_disruption(
+    routes: List[TransportRoute],
+    destinations: List[Destination],
+    delay_hours: float = 6.0,
+    demand_shock_pct: float = -0.30,
+    capacity_reduction_pct: float = 0.0,
+) -> Tuple[List[TransportRoute], List[Destination]]:
+    """Simulates realistic supply-chain complications (highway delays, demand shocks, fleet reduction)."""
+    if delay_hours < 0:
+        raise ValueError("delay_hours must be non-negative.")
+    if not -1.0 <= demand_shock_pct <= 5.0:
+        raise ValueError("demand_shock_pct must be between -1.0 and 5.0.")
+    if not 0.0 <= capacity_reduction_pct < 1.0:
+        raise ValueError("capacity_reduction_pct must be in [0.0, 1.0).")
+
+    disrupted_routes = [
+        r.model_copy(
+            update={
+                "travel_time_hrs": round(r.travel_time_hrs + delay_hours, 2),
+                "vehicle_capacity_kg": max(1.0, round(r.vehicle_capacity_kg * (1.0 - capacity_reduction_pct), 2)),
+            }
+        )
+        for r in routes
+    ]
+
+    disrupted_dests = [
+        d.model_copy(
+            update={
+                "demand_kg": max(0.0, round(d.demand_kg * (1.0 + demand_shock_pct), 2)),
+            }
+        )
+        for d in destinations
+    ]
+
+    return disrupted_routes, disrupted_dests
+
+
+def apply_temperature_excursion(
+    batches: List[Batch],
+    ambient_temp_c: float = 4.0,
+    reference_temp_c: float = 4.0,
+    q10_factor: float = 2.0,
+) -> List[Batch]:
+    """
+    Adjusts batch remaining shelf life using the biological Q10 thermal respiration law:
+    Effective Shelf Life = Nominal Shelf Life / (Q10 ^ ((T_actual - T_ref) / 10)).
+    """
+    if ambient_temp_c <= reference_temp_c:
+        return [b.model_copy(update={"storage_temp_c": ambient_temp_c}) for b in batches]
+
+    acceleration = q10_factor ** ((ambient_temp_c - reference_temp_c) / 10.0)
+    adjusted_batches: List[Batch] = []
+    for b in batches:
+        # Storable dry bulbs (Onion) are less sensitive to cold-chain excursion than wet produce
+        effective_accel = 1.0 + (acceleration - 1.0) * (0.25 if b.commodity == "Onion" else 1.0)
+        new_shelf_life = max(1.0, round(b.remaining_shelf_life_hrs / effective_accel, 1))
+        adjusted_batches.append(
+            b.model_copy(
+                update={
+                    "remaining_shelf_life_hrs": new_shelf_life,
+                    "storage_temp_c": ambient_temp_c,
+                }
+            )
+        )
+    return adjusted_batches
+
+
+==================================================
+FILE: .\engine\explainability.py
+==================================================
+"""engine/explainability.py: Evidence-backed decision explanation, formatting, and CSV sanitization."""
+
+from typing import Any, Dict, List
+import pandas as pd
+from .models import AllocationDecision, OptimizationSummary
+
+
+def format_inr(number: float, prefix: str = "\u20b9", decimals: int = 0) -> str:
+    """Formats a float into the Indian Numbering System (Lakhs, Crores) without code duplication."""
+    neg = "-" if number < 0 else ""
+    num_abs = abs(float(number))
+    formatted_float = f"{num_abs:.{decimals}f}"
+    parts = formatted_float.split(".")
+    integer_part = parts[0]
+    decimal_part = f".{parts[1]}" if decimals > 0 else ""
+
+    if len(integer_part) <= 3:
+        res = integer_part
+    else:
+        last3 = integer_part[-3:]
+        remaining = integer_part[:-3]
+        groups: List[str] = []
+        while len(remaining) > 2:
+            groups.insert(0, remaining[-2:])
+            remaining = remaining[:-2]
+        if remaining:
+            groups.insert(0, remaining)
+        res = ",".join(groups) + "," + last3
+
+    return f"{prefix}{neg}{res}{decimal_part}" if prefix else f"{neg}{res}{decimal_part}"
+
+
+def sanitize_csv_value(val: Any) -> Any:
+    """
+    Security safeguard: Neutralizes spreadsheet formula injection (CSV Injection)
+    by prefixing strings starting with '=', '+', '-', '@', tab, or CR with a single quote.
+    """
+    if isinstance(val, str) and val.startswith(("=", "+", "-", "@", "\t", "\r")):
+        return f"'{val}"
+    return val
+
+
+class DecisionExplainer:
+    """Generates transparent, auditable explanations for logistics and procurement teams."""
+
+    @staticmethod
+    def generate_audit_table(
+        allocations: List[AllocationDecision], sanitize_for_export: bool = False
+    ) -> pd.DataFrame:
+        records = []
+        for a in allocations:
+            status = "APPROVED" if a.shelf_life_buffer_hrs > 0 else "REJECTED/SPOILED"
+            row = {
+                "Batch": a.batch_id,
+                "Commodity": a.commodity,
+                "Destination": a.dest_id,
+                "Quantity (kg)": a.quantity_kg,
+                "Shelf Life (h)": a.remaining_shelf_life_hrs,
+                "Transit (h)": a.travel_time_hrs,
+                "Buffer Upon Arrival (h)": a.shelf_life_buffer_hrs,
+                "Discount %": f"{int(round(a.discount_pct * 100))}%",
+                "Net Margin (\u20b9/kg)": round(a.net_profit / a.quantity_kg, 2) if a.quantity_kg > 0 else 0.0,
+                "Status": status,
+                "Audit Reason": a.reason,
+            }
+            if sanitize_for_export:
+                row = {k: sanitize_csv_value(v) for k, v in row.items()}
+            records.append(row)
+        return pd.DataFrame(records)
+
+    @staticmethod
+    def explain_comparison(baseline: OptimizationSummary, fresh: OptimizationSummary) -> Dict[str, str]:
+        profit_diff = fresh.net_profit - baseline.net_profit
+        spoilage_reduction = baseline.spoilage_rate_pct - fresh.spoilage_rate_pct
+        fulfillment_gain = fresh.demand_fulfillment_pct - baseline.demand_fulfillment_pct
+
+        return {
+            "Profit Delta": (
+                f"+{format_inr(profit_diff, decimals=2)} "
+                f"({((profit_diff / max(abs(baseline.net_profit), 1.0)) * 100.0):+.1f}%)"
+            ),
+            "Spoilage Reduction": f"{spoilage_reduction:+.1f}% points lower spoilage",
+            "Fulfillment Delta": f"{fulfillment_gain:+.1f}% points higher demand fulfillment",
+            "Key Driver": (
+                "FreshRoute prevented in-transit spoilage by enforcing arrival buffer thresholds, "
+                "routed high-perishability stock to high-margin close hubs, and liquidated aging batches "
+                "via dynamic discounting before expiration."
+            ),
+        }
+
+
+==================================================
+FILE: .\engine\freshroute_solver.py
+==================================================
+"""engine/freshroute_solver.py: Constrained Optimization Solver with Clearance Elasticity & LP Support."""
+
+from collections import defaultdict
+import time
+from typing import Any, Dict, List, Literal, Tuple
+
+import numpy as np
+from scipy.optimize import linprog
+
+from .models import (
+    AllocationDecision,
+    Batch,
+    Destination,
+    OptimizationSummary,
+    TransportRoute,
+    UncertaintyReport,
+)
+
+
+class FreshRouteSolver:
+    """
+    Intelligent Decision Engine:
+    1. Feasibility: Enforces remaining_shelf_life >= travel_time + handling_time + min_safe_buffer.
+    2. Targeted Dynamic Clearance: Applies calibrated discounts (0-25%) when arrival buffer < 12h
+       to stimulate rapid mandi absorption and prevent commercial dock rejection.
+    3. Clearance Elasticity: Models buyer absorption velocity when discounts are constrained.
+    4. Dual Solver Support:
+       - 'urgency_margin': Priority-Index greedy dispatch (fast, deterministic explainability).
+       - 'lp_highs': Exact Linear Programming via SciPy HiGHS simplex/interior-point solver.
+    """
+
+    def __init__(
+        self,
+        min_safe_buffer_hrs: float = 2.0,
+        discount_threshold_hrs: float = 12.0,
+        max_discount_pct: float = 0.25,
+        spoilage_penalty_per_kg: float = 5.0,
+        solver_mode: Literal["urgency_margin", "lp_highs"] = "urgency_margin",
+    ):
+        if min_safe_buffer_hrs < 0:
+            raise ValueError("min_safe_buffer_hrs must be non-negative.")
+        if discount_threshold_hrs <= 0:
+            raise ValueError("discount_threshold_hrs must be positive.")
+        if not 0.0 <= max_discount_pct <= 1.0:
+            raise ValueError("max_discount_pct must be between 0.0 and 1.0.")
+        if spoilage_penalty_per_kg < 0:
+            raise ValueError("spoilage_penalty_per_kg must be non-negative.")
+
+        self.min_safe_buffer_hrs = min_safe_buffer_hrs
+        self.discount_threshold_hrs = discount_threshold_hrs
+        self.max_discount_pct = max_discount_pct
+        self.spoilage_penalty_per_kg = spoilage_penalty_per_kg
+        self.solver_mode = solver_mode
+
+    def calculate_discount_and_clearance(self, buffer_hrs: float) -> Tuple[float, float, str]:
+        """
+        Calculates dynamic discount and expected market clearance rate.
+        Disclosed Rule:
+        - When arrival buffer >= 12.0h, 0% discount is required (100% clearance).
+        - When 2.0h <= arrival buffer < 12.0h, urgency scales linearly:
+          urgency = (12.0 - buffer) / 12.0.
+        - Market requires at least `urgency * 20%` discount for 100% immediate absorption.
+        """
+        if buffer_hrs <= 0:
+            return 0.0, 0.0, "EXPIRED"
+        if buffer_hrs >= self.discount_threshold_hrs:
+            return 0.0, 1.0, "Full Price (Adequate Buffer)"
+
+        urgency = (self.discount_threshold_hrs - buffer_hrs) / self.discount_threshold_hrs
+        required_clearance_discount = urgency * 0.20
+        actual_discount = round(urgency * self.max_discount_pct, 2)
+
+        if actual_discount >= required_clearance_discount:
+            clearance_rate = 1.0
+            reason = (
+                f"Dynamic clearance {int(actual_discount * 100)}% applied: "
+                "100% inventory cleared in time"
+            )
+        else:
+            shortfall = required_clearance_discount - actual_discount
+            clearance_rate = max(0.50, round(1.0 - (shortfall * 2.5), 2))
+            reason = (
+                f"Under-discounted ({int(actual_discount * 100)}% vs "
+                f"{int(required_clearance_discount * 100)}% req): "
+                f"only {int(clearance_rate * 100)}% cleared before expiry"
+            )
+
+        return actual_discount, clearance_rate, reason
+
+    def _build_candidates(
+        self,
+        batches: List[Batch],
+        destinations: List[Destination],
+        route_map: Dict[Tuple[str, str], TransportRoute],
+    ) -> List[Dict[str, Any]]:
+        """Builds feasible (batch, destination) candidate arcs using O(B + D) commodity indexing."""
+        dests_by_commodity: Dict[str, List[Destination]] = defaultdict(list)
+        for d in destinations:
+            dests_by_commodity[d.commodity].append(d)
+
+        candidates: List[Dict[str, Any]] = []
+        for b in batches:
+            for d in dests_by_commodity.get(b.commodity, []):
+                route = route_map.get((b.origin, d.dest_id))
+                if not route:
+                    continue
+
+                total_transit_hrs = route.travel_time_hrs + d.handling_time_hrs
+                buffer_hrs = b.remaining_shelf_life_hrs - total_transit_hrs
+                if buffer_hrs < self.min_safe_buffer_hrs:
+                    continue
+
+                discount_pct, clearance_rate, discount_reason = (
+                    self.calculate_discount_and_clearance(buffer_hrs)
+                )
+                effective_price = d.selling_price_per_kg * (1.0 - discount_pct)
+                unit_margin = (
+                    (effective_price * clearance_rate)
+                    - route.cost_per_kg
+                    - b.base_cost_per_kg
+                    - ((1.0 - clearance_rate) * self.spoilage_penalty_per_kg)
+                )
+
+                if unit_margin <= 0:
+                    continue
+
+                urgency_multiplier = 1.0 + (3.0 / max(b.remaining_shelf_life_hrs, 1.0))
+                priority_index = unit_margin * urgency_multiplier
+
+                candidates.append(
+                    {
+                        "batch": b,
+                        "dest": d,
+                        "route": route,
+                        "buffer_hrs": buffer_hrs,
+                        "discount_pct": discount_pct,
+                        "clearance_rate": clearance_rate,
+                        "discount_reason": discount_reason,
+                        "effective_price": effective_price,
+                        "unit_margin": effective_price - route.cost_per_kg - b.base_cost_per_kg,
+                        "net_unit_contribution": unit_margin,
+                        "priority_index": priority_index,
+                    }
+                )
+
+        candidates.sort(key=lambda x: x["priority_index"], reverse=True)
+        return candidates
+
+    def _allocate_lp(
+        self,
+        candidates: List[Dict[str, Any]],
+        batches: List[Batch],
+        destinations: List[Destination],
+        routes: List[TransportRoute],
+    ) -> List[Tuple[Dict[str, Any], float]]:
+        """Solves exact global allocation using SciPy HiGHS Linear Programming."""
+        if not candidates:
+            return []
+
+        n_vars = len(candidates)
+        # Maximize priority-weighted net contribution (avoiding perishable warehouse expiration penalties)
+        c = np.array(
+            [
+                -(
+                    cand["net_unit_contribution"]
+                    + (self.spoilage_penalty_per_kg if cand["batch"].remaining_shelf_life_hrs <= 24.0 else 0.0)
+                    + 1e-3 * cand["priority_index"]
+                )
+                for cand in candidates
+            ],
+            dtype=float,
+        )
+
+        rows: List[np.ndarray] = []
+        rhs: List[float] = []
+
+        # 1. Batch supply constraints
+        for b in batches:
+            row = np.zeros(n_vars, dtype=float)
+            has_arc = False
+            for idx, cand in enumerate(candidates):
+                if cand["batch"].batch_id == b.batch_id:
+                    row[idx] = 1.0
+                    has_arc = True
+            if has_arc:
+                rows.append(row)
+                rhs.append(b.quantity_kg)
+
+        # 2. Destination demand & reception capacity constraints
+        for d in destinations:
+            row = np.zeros(n_vars, dtype=float)
+            has_arc = False
+            for idx, cand in enumerate(candidates):
+                if cand["dest"].dest_id == d.dest_id:
+                    row[idx] = 1.0
+                    has_arc = True
+            if has_arc:
+                cap_limit = (
+                    min(d.demand_kg, d.max_reception_capacity_kg)
+                    if d.max_reception_capacity_kg is not None
+                    else d.demand_kg
+                )
+                rows.append(row)
+                rhs.append(cap_limit)
+
+        # 3. Route vehicle capacity constraints
+        for r in routes:
+            row = np.zeros(n_vars, dtype=float)
+            has_arc = False
+            for idx, cand in enumerate(candidates):
+                if (cand["route"].origin, cand["route"].dest_id) == (r.origin, r.dest_id):
+                    row[idx] = 1.0
+                    has_arc = True
+            if has_arc:
+                rows.append(row)
+                rhs.append(r.vehicle_capacity_kg)
+
+        a_ub = np.vstack(rows) if rows else None
+        b_ub = np.array(rhs, dtype=float) if rhs else None
+
+        res = linprog(c, A_ub=a_ub, b_ub=b_ub, bounds=(0, None), method="highs")
+        if not res.success or res.x is None:
+            return []
+
+        return [
+            (cand, round(float(qty), 2))
+            for cand, qty in zip(candidates, res.x)
+            if qty > 1e-4
+        ]
+
+    def solve(
+        self,
+        batches: List[Batch],
+        destinations: List[Destination],
+        routes: List[TransportRoute],
+    ) -> OptimizationSummary:
+        start_ns = time.perf_counter_ns()
+
+        route_map = {(r.origin, r.dest_id): r for r in routes}
+        remaining_demand = {
+            d.dest_id: (
+                min(d.demand_kg, d.max_reception_capacity_kg)
+                if d.max_reception_capacity_kg is not None
+                else d.demand_kg
+            )
+            for d in destinations
+        }
+        remaining_route_cap = {(r.origin, r.dest_id): r.vehicle_capacity_kg for r in routes}
+        total_inventory_kg = sum(b.quantity_kg for b in batches)
+
+        candidates = self._build_candidates(batches, destinations, route_map)
+        batch_remaining_qty = {b.batch_id: b.quantity_kg for b in batches}
+        allocations: List[AllocationDecision] = []
+        dispatched_kg = 0.0
+        spoiled_kg = 0.0
+        fulfilled_kg = 0.0
+
+        if self.solver_mode == "lp_highs":
+            planned_dispatch = self._allocate_lp(candidates, batches, destinations, routes)
+        else:
+            planned_dispatch = []
+            for cand in candidates:
+                b: Batch = cand["batch"]
+                d: Destination = cand["dest"]
+                r: TransportRoute = cand["route"]
+
+                avail_b = batch_remaining_qty[b.batch_id]
+                avail_d = remaining_demand[d.dest_id]
+                avail_cap = remaining_route_cap[(r.origin, r.dest_id)]
+
+                alloc_qty = min(avail_b, avail_d, avail_cap)
+                if alloc_qty <= 0:
+                    continue
+
+                batch_remaining_qty[b.batch_id] -= alloc_qty
+                remaining_demand[d.dest_id] -= alloc_qty
+                remaining_route_cap[(r.origin, r.dest_id)] -= alloc_qty
+                planned_dispatch.append((cand, alloc_qty))
+
+        if self.solver_mode == "lp_highs":
+            for cand, alloc_qty in planned_dispatch:
+                batch_remaining_qty[cand["batch"].batch_id] -= alloc_qty
+
+        for cand, alloc_qty in planned_dispatch:
+            b = cand["batch"]
+            d = cand["dest"]
+            r = cand["route"]
+
+            clearance = cand["clearance_rate"]
+            sold_qty = alloc_qty * clearance
+            unsold_spoiled_qty = alloc_qty * (1.0 - clearance)
+
+            spoiled_kg += unsold_spoiled_qty
+            fulfilled_kg += sold_qty
+            dispatched_kg += alloc_qty
+
+            gross = sold_qty * cand["effective_price"]
+            t_cost = alloc_qty * r.cost_per_kg
+            p_cost = alloc_qty * b.base_cost_per_kg
+            net = gross - t_cost - p_cost
+
+            reason = (
+                f"FreshRoute: Margin \u20b9{cand['unit_margin']:.1f}/kg. "
+                f"Buffer {cand['buffer_hrs']:.1f}h. {cand['discount_reason']}."
+            )
+
+            allocations.append(
+                AllocationDecision(
+                    batch_id=b.batch_id,
+                    dest_id=d.dest_id,
+                    commodity=b.commodity,
+                    quantity_kg=alloc_qty,
+                    sold_qty_kg=round(sold_qty, 2),
+                    clearance_rate=clearance,
+                    travel_time_hrs=r.travel_time_hrs,
+                    remaining_shelf_life_hrs=b.remaining_shelf_life_hrs,
+                    shelf_life_buffer_hrs=round(cand["buffer_hrs"], 1),
+                    base_price_per_kg=d.selling_price_per_kg,
+                    discount_pct=cand["discount_pct"],
+                    final_price_per_kg=round(cand["effective_price"], 2),
+                    transport_cost_per_kg=r.cost_per_kg,
+                    base_cost_per_kg=b.base_cost_per_kg,
+                    gross_revenue=round(gross, 2),
+                    transport_cost_total=round(t_cost, 2),
+                    procurement_cost_total=round(p_cost, 2),
+                    net_profit=round(net, 2),
+                    reason=reason,
+                )
+            )
+
+        # Unallocated inventory expiring in warehouse within 24h planning horizon
+        for b in batches:
+            rem = max(0.0, batch_remaining_qty[b.batch_id])
+            if rem > 0 and b.remaining_shelf_life_hrs <= 24.0:
+                spoiled_kg += rem
+
+        unsold_unspoiled = max(0.0, total_inventory_kg - dispatched_kg - spoiled_kg)
+
+        tot_gross = sum(a.gross_revenue for a in allocations)
+        tot_trans = sum(a.transport_cost_total for a in allocations)
+        tot_proc = sum(a.procurement_cost_total for a in allocations)
+        waste_penalty = spoiled_kg * self.spoilage_penalty_per_kg
+        net_profit = tot_gross - tot_trans - tot_proc - waste_penalty
+
+        total_demand = sum(d.demand_kg for d in destinations)
+        fulfillment_pct = (fulfilled_kg / total_demand * 100.0) if total_demand > 0 else 0.0
+        spoilage_pct = (spoiled_kg / total_inventory_kg * 100.0) if total_inventory_kg > 0 else 0.0
+        elapsed_ms = (time.perf_counter_ns() - start_ns) / 1_000_000.0
+
+        return OptimizationSummary(
+            strategy_name="FreshRoute Intelligent Engine",
+            total_inventory_kg=total_inventory_kg,
+            dispatched_kg=round(dispatched_kg, 1),
+            spoiled_kg=round(spoiled_kg, 1),
+            unsold_unspoiled_kg=round(unsold_unspoiled, 1),
+            spoilage_rate_pct=round(spoilage_pct, 2),
+            demand_fulfillment_pct=round(fulfillment_pct, 2),
+            total_gross_revenue=round(tot_gross, 2),
+            total_transport_cost=round(tot_trans, 2),
+            total_procurement_cost=round(tot_proc, 2),
+            disposal_waste_cost=round(waste_penalty, 2),
+            net_profit=round(net_profit, 2),
+            solve_time_ms=round(elapsed_ms, 3),
+            allocations=allocations,
+        )
+
+    def evaluate_uncertainty(
+        self,
+        batches: List[Batch],
+        destinations: List[Destination],
+        routes: List[TransportRoute],
+        runs: int = 50,
+        shelf_life_noise_pct: float = 0.10,
+        transit_noise_pct: float = 0.15,
+        demand_noise_pct: float = 0.10,
+        seed: int = 42,
+    ) -> UncertaintyReport:
+        """
+        PS 07 Optional Extension: Monte Carlo sensitivity evaluation across uncertainty ranges
+        in remaining shelf life, highway travel times, and destination demand.
+        """
+        rng = np.random.default_rng(seed)
+        profits: List[float] = []
+        spoilages: List[float] = []
+        fulfillments: List[float] = []
+
+        for _ in range(runs):
+            sim_batches = [
+                b.model_copy(
+                    update={
+                        "remaining_shelf_life_hrs": max(
+                            1.0,
+                            round(
+                                b.remaining_shelf_life_hrs
+                                * float(rng.uniform(1.0 - shelf_life_noise_pct, 1.0 + shelf_life_noise_pct)),
+                                2,
+                            ),
+                        )
+                    }
+                )
+                for b in batches
+            ]
+            sim_routes = [
+                r.model_copy(
+                    update={
+                        "travel_time_hrs": max(
+                            0.5,
+                            round(
+                                r.travel_time_hrs
+                                * float(rng.uniform(1.0 - transit_noise_pct, 1.0 + transit_noise_pct)),
+                                2,
+                            ),
+                        )
+                    }
+                )
+                for r in routes
+            ]
+            sim_dests = [
+                d.model_copy(
+                    update={
+                        "demand_kg": max(
+                            0.0,
+                            round(
+                                d.demand_kg
+                                * float(rng.uniform(1.0 - demand_noise_pct, 1.0 + demand_noise_pct)),
+                                2,
+                            ),
+                        )
+                    }
+                )
+                for d in destinations
+            ]
+
+            res = self.solve(sim_batches, sim_dests, sim_routes)
+            profits.append(res.net_profit)
+            spoilages.append(res.spoilage_rate_pct)
+            fulfillments.append(res.demand_fulfillment_pct)
+
+        arr_p = np.array(profits, dtype=float)
+        return UncertaintyReport(
+            runs=runs,
+            mean_net_profit=round(float(np.mean(arr_p)), 2),
+            std_net_profit=round(float(np.std(arr_p)), 2),
+            p5_net_profit=round(float(np.percentile(arr_p, 5)), 2),
+            p95_net_profit=round(float(np.percentile(arr_p, 95)), 2),
+            mean_spoilage_pct=round(float(np.mean(spoilages)), 2),
+            mean_fulfillment_pct=round(float(np.mean(fulfillments)), 2),
+        )
+
+
+==================================================
+FILE: .\engine\models.py
+==================================================
+"""engine/models.py: Core data schemas with strict constraint and security validations."""
+
+from typing import List, Optional
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class Batch(BaseModel):
+    """Represents a perishable inventory batch at an origin hub."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
+
+    batch_id: str = Field(min_length=1, max_length=64, description="Unique batch identifier")
+    commodity: str = Field(min_length=1, max_length=64, description="Produce commodity type")
+    quantity_kg: float = Field(gt=0.0, le=1_000_000.0, description="Quantity in kilograms")
+    remaining_shelf_life_hrs: float = Field(
+        gt=0.0, le=8760.0, description="Estimated remaining shelf life in hours"
+    )
+    base_cost_per_kg: float = Field(
+        ge=0.0, le=100_000.0, description="Cost of procurement/production per kg"
+    )
+    origin: str = Field(default="Warehouse-Central", min_length=1, max_length=64)
+    storage_temp_c: float = Field(
+        default=4.0, ge=-30.0, le=60.0, description="Observed cold-chain temperature in Celsius"
+    )
+    harvest_date: Optional[str] = Field(default=None, max_length=32)
+
+
+class Destination(BaseModel):
+    """Represents a destination market (mandi/retail hub) and its demand parameters."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
+
+    dest_id: str = Field(min_length=1, max_length=64, description="Unique destination ID")
+    name: str = Field(min_length=1, max_length=128, description="Destination market name")
+    commodity: str = Field(min_length=1, max_length=64, description="Demanded commodity")
+    demand_kg: float = Field(ge=0.0, le=1_000_000.0, description="Maximum demand at destination")
+    selling_price_per_kg: float = Field(
+        gt=0.0, le=100_000.0, description="Contracted or market selling price per kg"
+    )
+    handling_time_hrs: float = Field(
+        default=2.0, ge=0.0, le=168.0, description="Unloading and dock-to-shelf handling time"
+    )
+    max_reception_capacity_kg: Optional[float] = Field(
+        default=None, gt=0.0, le=1_000_000.0, description="Optional dock reception capacity limit"
+    )
+
+
+class TransportRoute(BaseModel):
+    """Represents a logistics corridor between an origin hub and destination market."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
+
+    origin: str = Field(min_length=1, max_length=64)
+    dest_id: str = Field(min_length=1, max_length=64)
+    travel_time_hrs: float = Field(gt=0.0, le=720.0, description="Transit time in hours")
+    cost_per_kg: float = Field(ge=0.0, le=10_000.0, description="Transport cost in INR per kg")
+    vehicle_capacity_kg: float = Field(
+        default=10000.0, gt=0.0, le=1_000_000.0, description="Maximum vehicle payload capacity"
+    )
+
+
+class AllocationDecision(BaseModel):
+    """Auditable record of a single batch-to-destination dispatch allocation."""
+
+    batch_id: str
+    dest_id: str
+    commodity: str
+    quantity_kg: float = Field(ge=0.0)
+    sold_qty_kg: float = Field(default=0.0, ge=0.0)
+    clearance_rate: float = Field(default=1.0, ge=0.0, le=1.0)
+    travel_time_hrs: float = Field(ge=0.0)
+    remaining_shelf_life_hrs: float = Field(ge=0.0)
+    shelf_life_buffer_hrs: float
+    base_price_per_kg: float = Field(ge=0.0)
+    discount_pct: float = Field(ge=0.0, le=1.0)
+    final_price_per_kg: float = Field(ge=0.0)
+    transport_cost_per_kg: float = Field(ge=0.0)
+    base_cost_per_kg: float = Field(ge=0.0)
+    gross_revenue: float = Field(ge=0.0)
+    transport_cost_total: float = Field(ge=0.0)
+    procurement_cost_total: float = Field(ge=0.0)
+    net_profit: float
+    reason: str
+
+    @model_validator(mode="after")
+    def set_default_sold_qty(self) -> "AllocationDecision":
+        if self.sold_qty_kg == 0.0 and self.gross_revenue > 0.0:
+            self.sold_qty_kg = round(self.quantity_kg * self.clearance_rate, 2)
+        return self
+
+
+class OptimizationSummary(BaseModel):
+    """Aggregate KPI and financial summary of a distribution strategy."""
+
+    strategy_name: str
+    total_inventory_kg: float = Field(ge=0.0)
+    dispatched_kg: float = Field(ge=0.0)
+    spoiled_kg: float = Field(ge=0.0)
+    unsold_unspoiled_kg: float = Field(ge=0.0)
+    spoilage_rate_pct: float = Field(ge=0.0, le=100.0)
+    demand_fulfillment_pct: float = Field(ge=0.0, le=100.0)
+    total_gross_revenue: float = Field(ge=0.0)
+    total_transport_cost: float = Field(ge=0.0)
+    total_procurement_cost: float = Field(ge=0.0)
+    disposal_waste_cost: float = Field(default=0.0, ge=0.0)
+    net_profit: float
+    solve_time_ms: float = Field(default=0.0, ge=0.0)
+    allocations: List[AllocationDecision]
+
+
+class UncertaintyReport(BaseModel):
+    """Monte Carlo sensitivity metrics under shelf-life, transit, and demand uncertainty."""
+
+    runs: int = Field(gt=0)
+    mean_net_profit: float
+    std_net_profit: float = Field(ge=0.0)
+    p5_net_profit: float
+    p95_net_profit: float
+    mean_spoilage_pct: float = Field(ge=0.0, le=100.0)
+    mean_fulfillment_pct: float = Field(ge=0.0, le=100.0)
+
+
+==================================================
+FILE: .\engine\__init__.py
+==================================================
+"""FreshRoute Core Optimization & Explainability Package."""
+
+from .baseline_solver import BaselineSolver
+from .data_generator import (
+    apply_disruption,
+    apply_temperature_excursion,
+    get_standard_scenario,
+)
+from .explainability import DecisionExplainer, format_inr, sanitize_csv_value
+from .freshroute_solver import FreshRouteSolver
+from .models import (
+    AllocationDecision,
+    Batch,
+    Destination,
+    OptimizationSummary,
+    TransportRoute,
+    UncertaintyReport,
+)
+
+__all__ = [
+    "AllocationDecision",
+    "BaselineSolver",
+    "Batch",
+    "DecisionExplainer",
+    "Destination",
+    "FreshRouteSolver",
+    "OptimizationSummary",
+    "TransportRoute",
+    "UncertaintyReport",
+    "apply_disruption",
+    "apply_temperature_excursion",
+    "format_inr",
+    "get_standard_scenario",
+    "sanitize_csv_value",
+]
+
+
+==================================================
+FILE: .\tests\test_freshroute.py
+==================================================
+"""tests/test_freshroute.py: Comprehensive test suite covering constraints, LP, security, and edge cases."""
+
+import pytest
+from pydantic import ValidationError
+
+from engine.baseline_solver import BaselineSolver
+from engine.data_generator import (
+    apply_disruption,
+    apply_temperature_excursion,
+    get_standard_scenario,
+)
+from engine.explainability import DecisionExplainer, format_inr, sanitize_csv_value
+from engine.freshroute_solver import FreshRouteSolver
+from engine.models import Batch, Destination, TransportRoute
+
+
+def test_freshroute_outperforms_baseline():
+    batches, dests, routes = get_standard_scenario()
+    baseline = BaselineSolver().solve(batches, dests, routes)
+    fresh = FreshRouteSolver().solve(batches, dests, routes)
+
+    assert fresh.net_profit > baseline.net_profit, "FreshRoute should generate higher net profit"
+    assert fresh.spoilage_rate_pct <= baseline.spoilage_rate_pct, "FreshRoute should reduce or match spoilage"
+    assert fresh.net_profit == pytest.approx(502497.0, rel=1e-4)
+    assert baseline.net_profit == pytest.approx(321690.0, rel=1e-4)
+
+
+def test_zero_in_transit_spoilage_for_freshroute():
+    batches, dests, routes = get_standard_scenario()
+    solver = FreshRouteSolver()
+    fresh = solver.solve(batches, dests, routes)
+
+    for alloc in fresh.allocations:
+        assert alloc.shelf_life_buffer_hrs >= solver.min_safe_buffer_hrs - 1e-5, (
+            f"Batch {alloc.batch_id} violated minimum safe buffer upon arrival!"
+        )
+
+
+def test_capacity_and_demand_constraints_respected():
+    batches, dests, routes = get_standard_scenario()
+    fresh = FreshRouteSolver().solve(batches, dests, routes)
+
+    dest_allocs = {}
+    route_allocs = {}
+    for a in fresh.allocations:
+        dest_allocs[a.dest_id] = dest_allocs.get(a.dest_id, 0.0) + a.quantity_kg
+        route_allocs[a.dest_id] = route_allocs.get(a.dest_id, 0.0) + a.quantity_kg
+
+    for d in dests:
+        allocated = dest_allocs.get(d.dest_id, 0.0)
+        assert allocated <= d.demand_kg + 1e-4, f"Demand constraint violated for destination {d.dest_id}"
+
+    for r in routes:
+        allocated = route_allocs.get(r.dest_id, 0.0)
+        assert allocated <= r.vehicle_capacity_kg + 1e-4, f"Vehicle capacity violated for route {r.dest_id}"
+
+
+def test_disruption_handling_robustness():
+    """Verify solver stays robust when a 6-hour delay occurs across all routes."""
+    batches, dests, routes = get_standard_scenario()
+    bad_routes, bad_dests = apply_disruption(routes, dests, delay_hours=6.0, demand_shock_pct=-0.25)
+
+    fresh = FreshRouteSolver().solve(batches, bad_dests, bad_routes)
+    assert fresh.net_profit > 0, "Engine should stay profitable or preserve capital even under severe delays"
+
+
+def test_lp_highs_solver_mode():
+    """Verify SciPy HiGHS Linear Programming mode satisfies all constraints and beats baseline."""
+    batches, dests, routes = get_standard_scenario()
+    baseline = BaselineSolver().solve(batches, dests, routes)
+    lp_res = FreshRouteSolver(solver_mode="lp_highs").solve(batches, dests, routes)
+
+    assert lp_res.net_profit >= baseline.net_profit
+    assert lp_res.spoilage_rate_pct == 0.0
+    assert lp_res.demand_fulfillment_pct > baseline.demand_fulfillment_pct
+
+
+def test_max_reception_capacity_enforced():
+    """Verify destination max_reception_capacity_kg constraint caps allocations below demand_kg."""
+    batches = [
+        Batch(
+            batch_id="B-TOM-CAP",
+            commodity="Tomato",
+            quantity_kg=3000,
+            remaining_shelf_life_hrs=24.0,
+            base_cost_per_kg=10.0,
+            origin="Hub-A",
+        )
+    ]
+    dests = [
+        Destination(
+            dest_id="D-1",
+            name="Capped Market",
+            commodity="Tomato",
+            demand_kg=2500,
+            selling_price_per_kg=30.0,
+            handling_time_hrs=1.0,
+            max_reception_capacity_kg=1200.0,
+        )
+    ]
+    routes = [
+        TransportRoute(
+            origin="Hub-A", dest_id="D-1", travel_time_hrs=2.0, cost_per_kg=2.0, vehicle_capacity_kg=5000.0
+        )
+    ]
+    res = FreshRouteSolver().solve(batches, dests, routes)
+    assert res.dispatched_kg == pytest.approx(1200.0)
+
+
+def test_clearance_elasticity_and_fulfillment_alignment():
+    """Verify fulfillment_pct accurately reflects sold_qty_kg when candidates are skipped."""
+    batches, dests, routes = get_standard_scenario()
+    solver = FreshRouteSolver(max_discount_pct=0.05)
+    res = solver.solve(batches, dests, routes)
+
+    total_demand = sum(d.demand_kg for d in dests)
+    expected_fulfillment = round(sum(a.sold_qty_kg for a in res.allocations) / total_demand * 100.0, 2)
+    assert res.demand_fulfillment_pct == pytest.approx(expected_fulfillment, abs=1e-2)
+
+
+def test_temperature_excursion_decay():
+    """Verify Q10 thermal excursion reduces shelf life of perishable produce."""
+    batches, _, _ = get_standard_scenario()
+    heated = apply_temperature_excursion(batches, ambient_temp_c=14.0, reference_temp_c=4.0, q10_factor=2.0)
+
+    assert heated[0].remaining_shelf_life_hrs == pytest.approx(batches[0].remaining_shelf_life_hrs / 2.0, abs=0.1)
+
+
+def test_monte_carlo_uncertainty_evaluation():
+    """Verify Monte Carlo uncertainty simulator returns bounded statistical metrics."""
+    batches, dests, routes = get_standard_scenario()
+    report = FreshRouteSolver().evaluate_uncertainty(batches, dests, routes, runs=15, seed=123)
+
+    assert report.runs == 15
+    assert report.p5_net_profit <= report.mean_net_profit <= report.p95_net_profit
+    assert 0.0 <= report.mean_spoilage_pct <= 100.0
+
+
+def test_csv_injection_sanitization():
+    """Verify formula payloads are neutralized during CSV export generation."""
+    assert sanitize_csv_value("=cmd|' /C calc'!A0") == "'=cmd|' /C calc'!A0"
+    assert sanitize_csv_value("+SUM(A1:A10)") == "'+SUM(A1:A10)"
+    assert sanitize_csv_value("Safe Text") == "Safe Text"
+
+
+def test_indian_number_formatting():
+    """Verify format_inr accurately formats thousands, lakhs, crores, and negative values."""
+    assert format_inr(502497, prefix="\u20b9", decimals=2) == "\u20b95,02,497.00"
+    assert format_inr(-12345678, prefix="\u20b9", decimals=0) == "\u20b9-1,23,45,678"
+    assert format_inr(950, prefix="", decimals=0) == "950"
+
+
+def test_pydantic_constraint_validations():
+    """Verify invalid negative quantities or out-of-range parameters raise errors."""
+    with pytest.raises(ValidationError):
+        Batch(
+            batch_id="BAD",
+            commodity="Tomato",
+            quantity_kg=-100.0,
+            remaining_shelf_life_hrs=10.0,
+            base_cost_per_kg=10.0,
+        )
+
+    with pytest.raises(ValueError):
+        FreshRouteSolver(max_discount_pct=1.5)

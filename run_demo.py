@@ -1,38 +1,31 @@
-"""run_demo.py: One-command benchmark evaluator with Indian Numbering System."""
+"""run_demo.py: One-command benchmark evaluator with Indian Numbering System and accessible CLI modes."""
 
+import argparse
+import io
+import sys
 from tabulate import tabulate
-from engine.data_generator import get_standard_scenario, apply_disruption
+
 from engine.baseline_solver import BaselineSolver
+from engine.data_generator import apply_disruption, get_standard_scenario
+from engine.explainability import DecisionExplainer, format_inr
 from engine.freshroute_solver import FreshRouteSolver
-from engine.explainability import DecisionExplainer
 
 
-def format_inr(number: float, prefix: str = "₹", decimals: int = 2) -> str:
-    """Formats any float into Indian Numbering System (Lakhs, Crores)."""
-    neg = "-" if number < 0 else ""
-    num_abs = abs(number)
-    formatted_float = f"{num_abs:.{decimals}f}"
-    parts = formatted_float.split(".")
-    integer_part = parts[0]
-    decimal_part = f".{parts[1]}" if decimals > 0 else ""
-
-    if len(integer_part) <= 3:
-        res = integer_part
-    else:
-        last3 = integer_part[-3:]
-        remaining = integer_part[:-3]
-        groups = []
-        while len(remaining) > 2:
-            groups.insert(0, remaining[-2:])
-            remaining = remaining[:-2]
-        if remaining:
-            groups.insert(0, remaining)
-        res = ",".join(groups) + "," + last3
-
-    return f"{prefix}{neg}{res}{decimal_part}" if prefix else f"{neg}{res}{decimal_part}"
+def configure_utf8_output() -> None:
+    """Ensures Windows PowerShell/CMD terminals render UTF-8 symbols without mojibake."""
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except ValueError:
+            pass
 
 
-def run_benchmark():
+def run_benchmark(ascii_mode: bool = False) -> None:
+    configure_utf8_output()
+    currency = "INR " if ascii_mode else "\u20b9"
+    bullet = "*" if ascii_mode else "\u2022"
+    table_style = "grid" if ascii_mode else "fancy_grid"
+
     print("=" * 80)
     print("  FRESHROUTE: PERISHABLE PRODUCE DECISION-SUPPORT BENCHMARK")
     print("=" * 80)
@@ -46,28 +39,84 @@ def run_benchmark():
     fresh_res = fresh_solver.solve(batches, dests, routes)
 
     comparison_data = [
-        ["Total Inventory (kg)", f"{format_inr(base_res.total_inventory_kg, prefix='', decimals=0)}", f"{format_inr(fresh_res.total_inventory_kg, prefix='', decimals=0)}"],
-        ["Dispatched Quantity (kg)", f"{format_inr(base_res.dispatched_kg, prefix='', decimals=0)}", f"{format_inr(fresh_res.dispatched_kg, prefix='', decimals=0)}"],
-        ["Demand Fulfillment (%)", f"{base_res.demand_fulfillment_pct}%", f"{fresh_res.demand_fulfillment_pct}%"],
-        ["Spoilage Loss (kg)", f"{format_inr(base_res.spoiled_kg, prefix='', decimals=0)}", f"{format_inr(fresh_res.spoiled_kg, prefix='', decimals=0)}"],
-        ["Spoilage Rate (%)", f"{base_res.spoilage_rate_pct}%", f"{fresh_res.spoilage_rate_pct}%"],
-        ["Gross Revenue", f"{format_inr(base_res.total_gross_revenue)}", f"{format_inr(fresh_res.total_gross_revenue)}"],
-        ["Logistics Cost", f"{format_inr(base_res.total_transport_cost)}", f"{format_inr(fresh_res.total_transport_cost)}"],
-        ["Spoilage Penalties", f"{format_inr(base_res.disposal_waste_cost)}", f"{format_inr(fresh_res.disposal_waste_cost)}"],
-        ["NET PROFIT", f"{format_inr(base_res.net_profit)}", f"{format_inr(fresh_res.net_profit)}"],
+        [
+            "Total Inventory (kg)",
+            format_inr(base_res.total_inventory_kg, prefix="", decimals=0),
+            format_inr(fresh_res.total_inventory_kg, prefix="", decimals=0),
+        ],
+        [
+            "Dispatched Quantity (kg)",
+            format_inr(base_res.dispatched_kg, prefix="", decimals=0),
+            format_inr(fresh_res.dispatched_kg, prefix="", decimals=0),
+        ],
+        [
+            "Demand Fulfillment (%)",
+            f"{base_res.demand_fulfillment_pct}%",
+            f"{fresh_res.demand_fulfillment_pct}%",
+        ],
+        [
+            "Spoilage Loss (kg)",
+            format_inr(base_res.spoiled_kg, prefix="", decimals=0),
+            format_inr(fresh_res.spoiled_kg, prefix="", decimals=0),
+        ],
+        [
+            "Spoilage Rate (%)",
+            f"{base_res.spoilage_rate_pct}%",
+            f"{fresh_res.spoilage_rate_pct}%",
+        ],
+        [
+            "Gross Revenue",
+            format_inr(base_res.total_gross_revenue, prefix=currency, decimals=2),
+            format_inr(fresh_res.total_gross_revenue, prefix=currency, decimals=2),
+        ],
+        [
+            "Logistics Cost",
+            format_inr(base_res.total_transport_cost, prefix=currency, decimals=2),
+            format_inr(fresh_res.total_transport_cost, prefix=currency, decimals=2),
+        ],
+        [
+            "Spoilage Penalties",
+            format_inr(base_res.disposal_waste_cost, prefix=currency, decimals=2),
+            format_inr(fresh_res.disposal_waste_cost, prefix=currency, decimals=2),
+        ],
+        [
+            "NET PROFIT",
+            format_inr(base_res.net_profit, prefix=currency, decimals=2),
+            format_inr(fresh_res.net_profit, prefix=currency, decimals=2),
+        ],
+        [
+            "Solve Time (ms)",
+            f"{base_res.solve_time_ms:.3f} ms",
+            f"{fresh_res.solve_time_ms:.3f} ms",
+        ],
     ]
 
     print("\n[SCENARIO 1: NORMAL CONDITIONS - NASHIK CORRIDOR]")
-    print(tabulate(comparison_data, headers=["Metric", "Baseline (Naive FIFO)", "FreshRoute Intelligent"], tablefmt="fancy_grid"))
+    print(
+        tabulate(
+            comparison_data,
+            headers=["Metric", "Baseline (Naive FIFO)", "FreshRoute Intelligent"],
+            tablefmt=table_style,
+        )
+    )
 
     profit_diff = fresh_res.net_profit - base_res.net_profit
-    pct_gain = ((profit_diff / max(abs(base_res.net_profit), 1)) * 100)
+    pct_gain = (profit_diff / max(abs(base_res.net_profit), 1.0)) * 100.0
 
     print("\n--- PERFORMANCE HIGHLIGHTS ---")
-    print(f"• Profit Delta: +{format_inr(profit_diff)} (+{pct_gain:.1f}%)")
-    print(f"• Spoilage Reduction: +{base_res.spoilage_rate_pct - fresh_res.spoilage_rate_pct:.1f}% points lower spoilage")
-    print(f"• Fulfillment Delta: +{fresh_res.demand_fulfillment_pct - base_res.demand_fulfillment_pct:.1f}% points higher demand fulfillment")
-    print("• Key Driver: FreshRoute eliminated in-transit spoilage via arrival buffer enforcement and liquidated tight-buffer produce via targeted dynamic discounting.")
+    print(f"{bullet} Profit Delta: +{format_inr(profit_diff, prefix=currency, decimals=2)} (+{pct_gain:.1f}%)")
+    print(
+        f"{bullet} Spoilage Reduction: "
+        f"+{base_res.spoilage_rate_pct - fresh_res.spoilage_rate_pct:.2f}% points lower spoilage"
+    )
+    print(
+        f"{bullet} Fulfillment Delta: "
+        f"+{fresh_res.demand_fulfillment_pct - base_res.demand_fulfillment_pct:.2f}% points higher demand fulfillment"
+    )
+    print(
+        f"{bullet} Key Driver: FreshRoute eliminated in-transit spoilage via arrival buffer enforcement "
+        "and liquidated tight-buffer produce via targeted dynamic discounting."
+    )
 
     # Stress Test
     print("\n" + "=" * 80)
@@ -79,17 +128,66 @@ def run_benchmark():
     fresh_dis = fresh_solver.solve(batches, dis_dests, dis_routes)
 
     stress_data = [
-        ["Spoilage Loss (kg)", f"{format_inr(base_dis.spoiled_kg, prefix='', decimals=0)}", f"{format_inr(fresh_dis.spoiled_kg, prefix='', decimals=0)}"],
-        ["Spoilage Rate (%)", f"{base_dis.spoilage_rate_pct}%", f"{fresh_dis.spoilage_rate_pct}%"],
-        ["NET PROFIT", f"{format_inr(base_dis.net_profit)}", f"{format_inr(fresh_dis.net_profit)}"],
+        [
+            "Spoilage Loss (kg)",
+            format_inr(base_dis.spoiled_kg, prefix="", decimals=0),
+            format_inr(fresh_dis.spoiled_kg, prefix="", decimals=0),
+        ],
+        [
+            "Spoilage Rate (%)",
+            f"{base_dis.spoilage_rate_pct}%",
+            f"{fresh_dis.spoilage_rate_pct}%",
+        ],
+        [
+            "NET PROFIT",
+            format_inr(base_dis.net_profit, prefix=currency, decimals=2),
+            format_inr(fresh_dis.net_profit, prefix=currency, decimals=2),
+        ],
     ]
-    print(tabulate(stress_data, headers=["Stress Metric", "Baseline (Naive FIFO)", "FreshRoute Resilient"], tablefmt="fancy_grid"))
+    print(
+        tabulate(
+            stress_data,
+            headers=["Stress Metric", "Baseline (Naive FIFO)", "FreshRoute Resilient"],
+            tablefmt=table_style,
+        )
+    )
+
+    # Monte Carlo Uncertainty Report
+    mc_report = fresh_solver.evaluate_uncertainty(batches, dests, routes, runs=30)
+    print("\n[MONTE CARLO UNCERTAINTY ANALYSIS (30 STOCHASTIC RUNS)]")
+    print(
+        f"{bullet} Expected Profit: {format_inr(mc_report.mean_net_profit, prefix=currency, decimals=2)} "
+        f"(5th-95th Percentile: {format_inr(mc_report.p5_net_profit, prefix=currency, decimals=0)} to "
+        f"{format_inr(mc_report.p95_net_profit, prefix=currency, decimals=0)})"
+    )
 
     print("\n[SAMPLE AUDIT TRAIL - FIRST 5 ALLOCATIONS]")
     audit_df = DecisionExplainer.generate_audit_table(fresh_res.allocations)
-    print(audit_df[["Batch", "Commodity", "Destination", "Quantity (kg)", "Buffer Upon Arrival (h)", "Discount %", "Net Margin (₹/kg)"]].head(5).to_string(index=False))
+    margin_col = "Net Margin (\u20b9/kg)"
+    print(
+        audit_df[
+            [
+                "Batch",
+                "Commodity",
+                "Destination",
+                "Quantity (kg)",
+                "Buffer Upon Arrival (h)",
+                "Discount %",
+                margin_col,
+            ]
+        ]
+        .head(5)
+        .to_string(index=False)
+    )
     print("\nBenchmark completed successfully.")
 
 
 if __name__ == "__main__":
-    run_benchmark()
+    parser = argparse.ArgumentParser(description="FreshRoute CLI Benchmark Runner")
+    parser.add_argument(
+        "--ascii",
+        action="store_true",
+        help="Use ASCII-only output for screen readers and legacy terminal environments.",
+    )
+    args = parser.parse_args()
+    run_benchmark(ascii_mode=args.ascii)
