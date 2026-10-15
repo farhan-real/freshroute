@@ -18,10 +18,12 @@ def test_freshroute_outperforms_baseline():
 
 def test_zero_in_transit_spoilage_for_freshroute():
     batches, dests, routes = get_standard_scenario()
-    fresh = FreshRouteSolver().solve(batches, dests, routes)
+    solver = FreshRouteSolver()
+    fresh = solver.solve(batches, dests, routes)
 
     for alloc in fresh.allocations:
-        assert alloc.shelf_life_buffer_hrs >= fresh.min_safe_buffer_hrs - 1e-5, (
+        # Checked against the solver's configured min_safe_buffer_hrs
+        assert alloc.shelf_life_buffer_hrs >= solver.min_safe_buffer_hrs - 1e-5, (
             f"Batch {alloc.batch_id} violated minimum safe buffer upon arrival!"
         )
 
