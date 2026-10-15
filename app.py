@@ -36,6 +36,28 @@ def format_inr(number: float, prefix: str = "₹", decimals: int = 0) -> str:
     return f"{prefix}{neg}{res}{decimal_part}" if prefix else f"{neg}{res}{decimal_part}"
 
 
+def render_metric_card(title: str, main_val: str, vs_val: str, delta_text: str, is_positive: bool, arrow: str):
+    """Renders a modern metric card with side-by-side values, independent arrow direction, and colored badge."""
+    badge_bg = "rgba(16, 185, 129, 0.15)" if is_positive else "rgba(239, 68, 68, 0.15)"
+    badge_color = "#10b981" if is_positive else "#ef4444"
+    badge_border = "1px solid rgba(16, 185, 129, 0.3)" if is_positive else "1px solid rgba(239, 68, 68, 0.3)"
+
+    card_html = f"""
+    <div style="background-color: #1e293b; padding: 18px 22px; border-radius: 10px; border: 1px solid #334155; margin-bottom: 16px;">
+        <div style="color: #94a3b8; font-size: 0.95rem; font-weight: 500; margin-bottom: 8px;">{title}</div>
+        <div style="display: flex; align-items: baseline; flex-wrap: wrap; gap: 12px; margin-bottom: 10px;">
+            <span style="color: #ffffff; font-size: 1.75rem; font-weight: 700; letter-spacing: -0.02em;">{main_val}</span>
+            <span style="color: #94a3b8; font-size: 1.35rem; font-weight: 500;">vs {vs_val}</span>
+        </div>
+        <div style="display: inline-flex; align-items: center; gap: 6px; background-color: {badge_bg}; color: {badge_color}; border: {badge_border}; font-size: 0.85rem; font-weight: 600; padding: 4px 10px; border-radius: 9999px;">
+            <span>{arrow}</span>
+            <span>{delta_text}</span>
+        </div>
+    </div>
+    """
+    st.markdown(card_html, unsafe_allow_html=True)
+
+
 st.set_page_config(
     page_title="FreshRoute | Decision Support System",
     layout="wide"
@@ -72,41 +94,61 @@ fresh_solver = FreshRouteSolver(min_safe_buffer_hrs=min_buffer, max_discount_pct
 base_res = baseline_solver.solve(batches, destinations, routes)
 fresh_res = fresh_solver.solve(batches, destinations, routes)
 
-# Top KPIs
-col1, col2, col3, col4 = st.columns(4)
-
+# Calculations
 profit_gain = fresh_res.net_profit - base_res.net_profit
-col1.metric(
-    "FreshRoute Net Profit",
-    f"{format_inr(fresh_res.net_profit)}",
-    f"+{format_inr(profit_gain)} vs Baseline"
-)
+profit_pct = (profit_gain / max(abs(base_res.net_profit), 1)) * 100
 
 spoilage_delta = fresh_res.spoilage_rate_pct - base_res.spoilage_rate_pct
-col2.metric(
-    "Spoilage Rate",
-    f"{fresh_res.spoilage_rate_pct}%",
-    f"{spoilage_delta:+.1f}% vs Baseline",
-    delta_color="inverse"
-)
-
 fulfill_delta = fresh_res.demand_fulfillment_pct - base_res.demand_fulfillment_pct
-col3.metric(
-    "Demand Fulfillment",
-    f"{fresh_res.demand_fulfillment_pct}%",
-    f"{fulfill_delta:+.1f}% vs Baseline"
-)
 
-# Volume actually received in usable/fresh condition
 fresh_accepted_kg = sum(a.quantity_kg for a in fresh_res.allocations if a.shelf_life_buffer_hrs >= min_buffer)
 base_accepted_kg = sum(a.quantity_kg for a in base_res.allocations if a.shelf_life_buffer_hrs >= 6.0)
 vol_delta = fresh_accepted_kg - base_accepted_kg
 
-col4.metric(
-    "Usable Volume Delivered",
-    f"{format_inr(fresh_accepted_kg, prefix='', decimals=0)} kg",
-    f"+{format_inr(vol_delta, prefix='', decimals=0)} kg vs Baseline"
-)
+st.markdown("### Operational and Financial Overview")
+
+# 2-Row Layout (2x2 Grid)
+row1_col1, row1_col2 = st.columns(2)
+with row1_col1:
+    render_metric_card(
+        title="Net Profit",
+        main_val=format_inr(fresh_res.net_profit),
+        vs_val=format_inr(base_res.net_profit),
+        delta_text=f"+{format_inr(profit_gain)} ({profit_pct:+.1f}%)" if profit_gain >= 0 else f"-{format_inr(abs(profit_gain))} ({profit_pct:.1f}%)",
+        is_positive=profit_gain >= 0,
+        arrow="↑" if profit_gain >= 0 else "↓"
+    )
+
+with row1_col2:
+    render_metric_card(
+        title="Spoilage Rate",
+        main_val=f"{fresh_res.spoilage_rate_pct}%",
+        vs_val=f"{base_res.spoilage_rate_pct}%",
+        delta_text=f"{abs(spoilage_delta):.1f}% reduction" if spoilage_delta <= 0 else f"{spoilage_delta:+.1f}% increase",
+        is_positive=spoilage_delta <= 0,
+        arrow="↓" if spoilage_delta <= 0 else "↑"
+    )
+
+row2_col1, row2_col2 = st.columns(2)
+with row2_col1:
+    render_metric_card(
+        title="Demand Fulfillment",
+        main_val=f"{fresh_res.demand_fulfillment_pct}%",
+        vs_val=f"{base_res.demand_fulfillment_pct:.1f}%",
+        delta_text=f"{fulfill_delta:+.1f}% points" if fulfill_delta >= 0 else f"{fulfill_delta:.1f}% points",
+        is_positive=fulfill_delta >= 0,
+        arrow="↑" if fulfill_delta >= 0 else "↓"
+    )
+
+with row2_col2:
+    render_metric_card(
+        title="Usable Volume Delivered",
+        main_val=f"{format_inr(fresh_accepted_kg, prefix='', decimals=0)} kg",
+        vs_val=f"{format_inr(base_accepted_kg, prefix='', decimals=0)} kg",
+        delta_text=f"+{format_inr(vol_delta, prefix='', decimals=0)} kg" if vol_delta >= 0 else f"-{format_inr(abs(vol_delta), prefix='', decimals=0)} kg",
+        is_positive=vol_delta >= 0,
+        arrow="↑" if vol_delta >= 0 else "↓"
+    )
 
 st.markdown("---")
 
