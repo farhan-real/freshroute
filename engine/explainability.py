@@ -1,8 +1,8 @@
-"""engine/explainability.py: Evidence-backed decision explanation, formatting, and CSV sanitization."""
+"""engine/explainability.py: Evidence-backed decision explanation, counterfactual logs, and CSV safety."""
 
 from typing import Any, Dict, List
 import pandas as pd
-from .models import AllocationDecision, OptimizationSummary
+from .models import AllocationDecision, OptimizationSummary, RejectedRoute
 
 
 def format_inr(number: float, prefix: str = "\u20b9", decimals: int = 0) -> str:
@@ -55,6 +55,7 @@ class DecisionExplainer:
                 "Commodity": a.commodity,
                 "Destination": a.dest_id,
                 "Quantity (kg)": a.quantity_kg,
+                "Cleared (kg)": a.sold_qty_kg,
                 "Shelf Life (h)": a.remaining_shelf_life_hrs,
                 "Transit (h)": a.travel_time_hrs,
                 "Buffer Upon Arrival (h)": a.shelf_life_buffer_hrs,
@@ -62,6 +63,28 @@ class DecisionExplainer:
                 "Net Margin (\u20b9/kg)": round(a.net_profit / a.quantity_kg, 2) if a.quantity_kg > 0 else 0.0,
                 "Status": status,
                 "Audit Reason": a.reason,
+            }
+            if sanitize_for_export:
+                row = {k: sanitize_csv_value(v) for k, v in row.items()}
+            records.append(row)
+        return pd.DataFrame(records)
+
+    @staticmethod
+    def generate_rejection_table(
+        rejected_routes: List[RejectedRoute], sanitize_for_export: bool = False
+    ) -> pd.DataFrame:
+        """Generates a counterfactual audit table explaining why specific routes were blocked."""
+        records = []
+        for r in rejected_routes:
+            row = {
+                "Batch": r.batch_id,
+                "Commodity": r.commodity,
+                "Destination": f"{r.destination_name} ({r.dest_id})",
+                "Shelf Life (h)": r.remaining_shelf_life_hrs,
+                "Req Transit+Handling (h)": r.required_transit_and_handling_hrs,
+                "Projected Buffer (h)": r.projected_buffer_hrs,
+                "Guardrail Triggered": r.rejection_category,
+                "Counterfactual Explanation": r.reason,
             }
             if sanitize_for_export:
                 row = {k: sanitize_csv_value(v) for k, v in row.items()}

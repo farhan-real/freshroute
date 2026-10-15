@@ -17,6 +17,7 @@ class BaselineSolver:
     """
     Standard naive baseline:
     - Dispatches oldest batches first (FIFO) to fulfill orders in order of destination appearance.
+    - Respects physical vehicle capacity and dock reception constraints.
     - Zero dynamic discounting.
     - Retail dock inspection: Shipments arriving with < 6.0h shelf-life buffer without clearance
       discounting fail commercial inspection and are rejected at the dock as spoiled.
@@ -39,15 +40,21 @@ class BaselineSolver:
         start_ns = time.perf_counter_ns()
 
         route_map = {(r.origin, r.dest_id): r for r in routes}
-        remaining_demand = {d.dest_id: d.demand_kg for d in destinations}
+        remaining_demand = {
+            d.dest_id: (
+                min(d.demand_kg, d.max_reception_capacity_kg)
+                if d.max_reception_capacity_kg is not None
+                else d.demand_kg
+            )
+            for d in destinations
+        }
+        remaining_route_cap = {(r.origin, r.dest_id): r.vehicle_capacity_kg for r in routes}
         total_inventory_kg = sum(b.quantity_kg for b in batches)
 
-        # Pre-index destinations by commodity for O(1) lookup instead of O(B * D) filtering
         dests_by_commodity: Dict[str, List[Destination]] = defaultdict(list)
         for d in destinations:
             dests_by_commodity[d.commodity].append(d)
 
-        # FIFO: oldest batches dispatched first
         sorted_batches = sorted(batches, key=lambda b: b.remaining_shelf_life_hrs)
         allocations: List[AllocationDecision] = []
         dispatched_kg = 0.0
@@ -69,7 +76,11 @@ class BaselineSolver:
                 if not route:
                     continue
 
-                alloc_qty = min(batch_qty, avail_demand)
+                avail_cap = remaining_route_cap[(batch.origin, dest.dest_id)]
+                if avail_cap <= 0:
+                    continue
+
+                alloc_qty = min(batch_qty, avail_demand, avail_cap)
                 if alloc_qty <= 0:
                     continue
 
@@ -124,6 +135,7 @@ class BaselineSolver:
                 )
 
                 remaining_demand[dest.dest_id] -= alloc_qty
+                remaining_route_cap[(batch.origin, dest.dest_id)] -= alloc_qty
                 batch_qty -= alloc_qty
                 dispatched_kg += alloc_qty
 
@@ -146,7 +158,7 @@ class BaselineSolver:
         return OptimizationSummary(
             strategy_name="Baseline (Naive FIFO)",
             total_inventory_kg=total_inventory_kg,
-            dispatched_kg=dispatched_kg,
+            dispatched_kg=round(dispatched_kg, 1),
             spoiled_kg=round(spoiled_kg, 1),
             unsold_unspoiled_kg=round(unsold_unspoiled, 1),
             spoilage_rate_pct=round(spoilage_pct, 2),
@@ -158,4 +170,5 @@ class BaselineSolver:
             net_profit=round(net_profit, 2),
             solve_time_ms=round(elapsed_ms, 3),
             allocations=allocations,
+            rejected_routes=[],
         )

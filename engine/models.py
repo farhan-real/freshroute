@@ -89,6 +89,20 @@ class AllocationDecision(BaseModel):
         return self
 
 
+class RejectedRoute(BaseModel):
+    """Counterfactual audit record explaining why a candidate (Batch, Destination) pair was rejected."""
+
+    batch_id: str
+    dest_id: str
+    destination_name: str
+    commodity: str
+    remaining_shelf_life_hrs: float
+    required_transit_and_handling_hrs: float
+    projected_buffer_hrs: float
+    rejection_category: str
+    reason: str
+
+
 class OptimizationSummary(BaseModel):
     """Aggregate KPI and financial summary of a distribution strategy."""
 
@@ -106,6 +120,7 @@ class OptimizationSummary(BaseModel):
     net_profit: float
     solve_time_ms: float = Field(default=0.0, ge=0.0)
     allocations: List[AllocationDecision]
+    rejected_routes: List[RejectedRoute] = Field(default_factory=list)
 
 
 class UncertaintyReport(BaseModel):
@@ -118,3 +133,11 @@ class UncertaintyReport(BaseModel):
     p95_net_profit: float
     mean_spoilage_pct: float = Field(ge=0.0, le=100.0)
     mean_fulfillment_pct: float = Field(ge=0.0, le=100.0)
+
+
+class ScenarioPayload(BaseModel):
+    """Validated schema for custom JSON scenario ingestion during hidden judge tests."""
+
+    batches: List[Batch] = Field(min_length=1, max_length=1000)
+    destinations: List[Destination] = Field(min_length=1, max_length=1000)
+    routes: List[TransportRoute] = Field(min_length=1, max_length=5000)

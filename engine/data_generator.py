@@ -1,7 +1,10 @@
-"""engine/data_generator.py: Dataset generator, cold-chain telemetry, and disruption scenarios."""
+"""engine/data_generator.py: Dataset generator, forecasting, replanning, and JSON scenario I/O."""
 
-from typing import List, Tuple
-from .models import Batch, Destination, TransportRoute
+import json
+from typing import Dict, List, Literal, Tuple, Union
+from .models import Batch, Destination, ScenarioPayload, TransportRoute
+
+SeasonalityMode = Literal["normal", "festival_surge", "weekend_rush", "monsoon_dip"]
 
 
 def get_standard_scenario() -> Tuple[List[Batch], List[Destination], List[TransportRoute]]:
@@ -276,7 +279,6 @@ def apply_temperature_excursion(
     acceleration = q10_factor ** ((ambient_temp_c - reference_temp_c) / 10.0)
     adjusted_batches: List[Batch] = []
     for b in batches:
-        # Storable dry bulbs (Onion) are less sensitive to cold-chain excursion than wet produce
         effective_accel = 1.0 + (acceleration - 1.0) * (0.25 if b.commodity == "Onion" else 1.0)
         new_shelf_life = max(1.0, round(b.remaining_shelf_life_hrs / effective_accel, 1))
         adjusted_batches.append(
@@ -288,3 +290,108 @@ def apply_temperature_excursion(
             )
         )
     return adjusted_batches
+
+
+def forecast_destination_demand(
+    destinations: List[Destination],
+    seasonality: SeasonalityMode = "normal",
+) -> List[Destination]:
+    """
+    PS 07 Optional Extension: Forecasts destination demand using commodity-specific
+    event and seasonality multipliers (e.g., Festival Surge, Weekend Rush, Monsoon Dip).
+    """
+    if seasonality == "normal":
+        return [d.model_copy() for d in destinations]
+
+    multipliers: Dict[SeasonalityMode, Dict[str, float]] = {
+        "normal": {"Mango": 1.0, "Spinach": 1.0, "Tomato": 1.0, "Onion": 1.0},
+        "festival_surge": {"Mango": 1.30, "Spinach": 1.15, "Tomato": 1.20, "Onion": 1.10},
+        "weekend_rush": {"Mango": 1.15, "Spinach": 1.25, "Tomato": 1.15, "Onion": 1.05},
+        "monsoon_dip": {"Mango": 0.80, "Spinach": 0.75, "Tomato": 0.85, "Onion": 0.95},
+    }
+    mode_map = multipliers.get(seasonality, multipliers["normal"])
+
+    forecasted: List[Destination] = []
+    for d in destinations:
+        factor = mode_map.get(d.commodity, 1.0)
+        forecasted.append(
+            d.model_copy(update={"demand_kg": round(d.demand_kg * factor, 2)})
+        )
+    return forecasted
+
+
+def inject_replanning_event(
+    batches: List[Batch],
+    destinations: List[Destination],
+    routes: List[TransportRoute],
+    add_spot_order: bool = False,
+    fleet_breakdown_pct: float = 0.0,
+) -> Tuple[List[Batch], List[Destination], List[TransportRoute]]:
+    """
+    PS 07 Optional Extension: Dynamic mid-day replanning when new urgent orders arrive
+    or fleet transport capacity drops due to vehicle breakdowns.
+    """
+    if not 0.0 <= fleet_breakdown_pct < 1.0:
+        raise ValueError("fleet_breakdown_pct must be in [0.0, 1.0).")
+
+    updated_batches = [b.model_copy() for b in batches]
+    updated_dests = [d.model_copy() for d in destinations]
+    updated_routes = [
+        r.model_copy(
+            update={
+                "vehicle_capacity_kg": max(
+                    1.0, round(r.vehicle_capacity_kg * (1.0 - fleet_breakdown_pct), 2)
+                )
+            }
+        )
+        for r in routes
+    ]
+
+    if add_spot_order:
+        origin = updated_batches[0].origin if updated_batches else "Hub-Nashik"
+        spot_dest = Destination(
+            dest_id="DEST-SPOT-MUM",
+            name="Mumbai Quick-Commerce Dark Stores (Spot Order)",
+            commodity="Tomato",
+            demand_kg=1800.0,
+            selling_price_per_kg=42.0,
+            handling_time_hrs=1.0,
+        )
+        spot_route = TransportRoute(
+            origin=origin,
+            dest_id="DEST-SPOT-MUM",
+            travel_time_hrs=4.0,
+            cost_per_kg=3.0,
+            vehicle_capacity_kg=3000.0,
+        )
+        updated_dests.append(spot_dest)
+        updated_routes.append(spot_route)
+
+    return updated_batches, updated_dests, updated_routes
+
+
+def export_scenario_to_json(
+    batches: List[Batch],
+    destinations: List[Destination],
+    routes: List[TransportRoute],
+) -> str:
+    """Serializes a scenario into a clean JSON string for template downloads or reproducibility."""
+    payload = ScenarioPayload(batches=batches, destinations=destinations, routes=routes)
+    return payload.model_dump_json(indent=2)
+
+
+def load_scenario_from_json(
+    raw_data: Union[str, bytes],
+    max_bytes: int = 2_000_000,
+) -> Tuple[List[Batch], List[Destination], List[TransportRoute]]:
+    """
+    Security-hardened JSON scenario loader for custom/hidden judge test datasets.
+    Enforces strict byte-size limits and Pydantic schema validation.
+    """
+    raw_bytes = raw_data.encode("utf-8") if isinstance(raw_data, str) else raw_data
+    if len(raw_bytes) > max_bytes:
+        raise ValueError(f"Scenario payload exceeds maximum allowed size of {max_bytes} bytes.")
+
+    parsed = json.loads(raw_bytes.decode("utf-8"))
+    payload = ScenarioPayload.model_validate(parsed)
+    return payload.batches, payload.destinations, payload.routes

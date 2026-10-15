@@ -1,17 +1,23 @@
 """app.py: FreshRoute Interactive Decision-Support Dashboard (WCAG Accessible & XSS-Hardened)."""
 
 import html
-from typing import Literal, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from pydantic import ValidationError
 
 from engine.baseline_solver import BaselineSolver
 from engine.data_generator import (
+    SeasonalityMode,
     apply_disruption,
     apply_temperature_excursion,
+    export_scenario_to_json,
+    forecast_destination_demand,
     get_standard_scenario,
+    inject_replanning_event,
+    load_scenario_from_json,
 )
 from engine.explainability import DecisionExplainer, format_inr
 from engine.freshroute_solver import FreshRouteSolver
@@ -20,6 +26,10 @@ from engine.models import OptimizationSummary, UncertaintyReport
 
 @st.cache_data(show_spinner=False)
 def run_cached_simulation(
+    custom_json_bytes: Optional[bytes],
+    seasonality_mode: SeasonalityMode,
+    add_spot_order: bool,
+    fleet_breakdown_pct: float,
     disruption_active: bool,
     transit_delay: float,
     demand_shock: float,
@@ -27,11 +37,28 @@ def run_cached_simulation(
     min_buffer: float,
     max_discount: float,
     solver_mode: Literal["urgency_margin", "lp_highs"],
-) -> Tuple[OptimizationSummary, OptimizationSummary, UncertaintyReport, pd.DataFrame]:
+) -> Tuple[OptimizationSummary, OptimizationSummary, UncertaintyReport, pd.DataFrame, str]:
     """Cached simulation pipeline for O(1) UI responsiveness across widget interactions."""
-    batches, destinations, routes = get_standard_scenario()
+    if custom_json_bytes is not None:
+        batches, destinations, routes = load_scenario_from_json(custom_json_bytes)
+    else:
+        batches, destinations, routes = get_standard_scenario()
+
+    if seasonality_mode != "normal":
+        destinations = forecast_destination_demand(destinations, seasonality=seasonality_mode)
+
+    if add_spot_order or fleet_breakdown_pct > 0.0:
+        batches, destinations, routes = inject_replanning_event(
+            batches,
+            destinations,
+            routes,
+            add_spot_order=add_spot_order,
+            fleet_breakdown_pct=fleet_breakdown_pct,
+        )
+
     if ambient_temp_c > 4.0:
         batches = apply_temperature_excursion(batches, ambient_temp_c=ambient_temp_c)
+
     if disruption_active:
         routes, destinations = apply_disruption(
             routes,
@@ -51,7 +78,111 @@ def run_cached_simulation(
     fresh_res = fresh_solver.solve(batches, destinations, routes)
     mc_report = fresh_solver.evaluate_uncertainty(batches, destinations, routes, runs=40)
     batch_df = pd.DataFrame([b.model_dump() for b in batches])
-    return base_res, fresh_res, mc_report, batch_df
+    scenario_json = export_scenario_to_json(batches, destinations, routes)
+    return base_res, fresh_res, mc_report, batch_df, scenario_json
+
+
+def build_sankey_figure(batches_df: pd.DataFrame, summary: OptimizationSummary) -> go.Figure:
+    """Builds a collision-safe, dark-theme Sankey diagram showing Batch -> Mandi -> Market Outcomes."""
+    batch_ids: List[str] = [str(x) for x in batches_df["batch_id"].tolist()]
+    dest_ids: List[str] = sorted({a.dest_id for a in summary.allocations})
+
+    node_keys = [f"b_{b}" for b in batch_ids] + [f"d_{d}" for d in dest_ids] + ["t_cleared", "t_spoiled", "t_reserve"]
+    labels = batch_ids + dest_ids + ["Cleared at Mandi", "Spoiled / Expired", "Storable Reserve (Unallocated)"]
+    node_idx = {k: i for i, k in enumerate(node_keys)}
+
+    sources: List[int] = []
+    targets: List[int] = []
+    values: List[float] = []
+    link_colors: List[str] = []
+
+    dispatched_by_batch: Dict[str, float] = {b_id: 0.0 for b_id in batch_ids}
+    cleared_by_dest: Dict[str, float] = {d_id: 0.0 for d_id in dest_ids}
+    spoiled_by_dest: Dict[str, float] = {d_id: 0.0 for d_id in dest_ids}
+
+    for alloc in summary.allocations:
+        b_key = f"b_{alloc.batch_id}"
+        d_key = f"d_{alloc.dest_id}"
+        if b_key in node_idx and d_key in node_idx and alloc.quantity_kg > 0:
+            sources.append(node_idx[b_key])
+            targets.append(node_idx[d_key])
+            values.append(alloc.quantity_kg)
+            link_colors.append("rgba(56, 189, 248, 0.40)")
+            dispatched_by_batch[alloc.batch_id] = (
+                dispatched_by_batch.get(alloc.batch_id, 0.0) + alloc.quantity_kg
+            )
+            cleared_by_dest[alloc.dest_id] += alloc.sold_qty_kg
+            spoiled_by_dest[alloc.dest_id] += max(0.0, alloc.quantity_kg - alloc.sold_qty_kg)
+
+    for d_id in dest_ids:
+        d_key = f"d_{d_id}"
+        if cleared_by_dest[d_id] > 0 and d_key in node_idx:
+            sources.append(node_idx[d_key])
+            targets.append(node_idx["t_cleared"])
+            values.append(cleared_by_dest[d_id])
+            link_colors.append("rgba(2, 132, 199, 0.55)")
+        if spoiled_by_dest[d_id] > 0 and d_key in node_idx:
+            sources.append(node_idx[d_key])
+            targets.append(node_idx["t_spoiled"])
+            values.append(spoiled_by_dest[d_id])
+            link_colors.append("rgba(217, 119, 6, 0.65)")
+
+    # Iterating over dict records avoids Pylance Series-to-float conversion warnings
+    for row in batches_df.to_dict(orient="records"):
+        b_id = str(row["batch_id"])
+        b_key = f"b_{b_id}"
+        qty = float(row["quantity_kg"])
+        shelf_life = float(row["remaining_shelf_life_hrs"])
+
+        rem_qty = max(0.0, qty - dispatched_by_batch.get(b_id, 0.0))
+        if rem_qty > 0 and b_key in node_idx:
+            sources.append(node_idx[b_key])
+            if shelf_life <= 24.0:
+                targets.append(node_idx["t_spoiled"])
+                link_colors.append("rgba(217, 119, 6, 0.65)")
+            else:
+                targets.append(node_idx["t_reserve"])
+                link_colors.append("rgba(148, 163, 184, 0.45)")
+            values.append(rem_qty)
+
+    if not values or not sources or not targets:
+        empty_fig = go.Figure()
+        empty_fig.update_layout(
+            title="Supply-Chain Mass Flow: No active allocations to display",
+            height=300,
+            paper_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#cbd5e1"),
+        )
+        return empty_fig
+
+    node_colors = (
+        ["#38bdf8"] * len(batch_ids)
+        + ["#818cf8"] * len(dest_ids)
+        + ["#0284c7", "#d97706", "#64748b"]
+    )
+
+    fig = go.Figure(
+        data=[
+            go.Sankey(
+                node=dict(
+                    pad=16,
+                    thickness=18,
+                    line=dict(color="#0f172a", width=1),
+                    label=labels,
+                    color=node_colors,
+                ),
+                link=dict(source=sources, target=targets, value=values, color=link_colors),
+            )
+        ]
+    )
+    fig.update_layout(
+        title="Supply-Chain Mass Flow: Inventory Batches → Destination Mandis → Outcome (kg)",
+        height=420,
+        paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#cbd5e1", size=12),
+        margin=dict(l=10, r=10, t=40, b=10),
+    )
+    return fig
 
 
 def render_metric_card(
@@ -62,10 +193,7 @@ def render_metric_card(
     is_positive: bool,
     arrow: str,
 ) -> None:
-    """
-    Renders an accessible, XSS-sanitized metric card with ARIA semantics
-    and WCAG AA compliant contrast ratios.
-    """
+    """Renders an accessible, XSS-sanitized metric card with ARIA semantics."""
     safe_title = html.escape(str(title))
     safe_main = html.escape(str(main_val))
     safe_vs = html.escape(str(vs_val))
@@ -73,7 +201,6 @@ def render_metric_card(
     safe_arrow = html.escape(str(arrow))
     sr_status = "Favorable change" if is_positive else "Unfavorable change"
 
-    # Colorblind-safe high-contrast badge styling (Sky Blue vs Amber/Orange)
     badge_bg = "rgba(14, 165, 233, 0.18)" if is_positive else "rgba(245, 158, 11, 0.18)"
     badge_color = "#38bdf8" if is_positive else "#fbbf24"
     badge_border = (
@@ -104,7 +231,9 @@ st.set_page_config(
     layout="wide",
 )
 
-# ----------------- SIDEBAR: REDESIGNED CONTROL CONSOLE -----------------
+# ----------------- SIDEBAR: CONTROL CONSOLE -----------------
+
+custom_json_bytes: Optional[bytes] = None
 
 with st.sidebar:
     st.markdown(
@@ -180,18 +309,62 @@ with st.sidebar:
         demand_shock = 0.0
 
     ambient_temp_c = st.slider(
-        "Cold-Chain Storage Temp (\u00b0C)",
+        "Cold-Chain Storage Temp (°C)",
         min_value=4.0,
         max_value=24.0,
         value=4.0,
         step=2.0,
-        help="Simulates reefer cooling excursions using Q10 biological respiration decay (4\u00b0C = nominal).",
+        help="Simulates reefer cooling excursions using Q10 biological respiration decay (4°C = nominal).",
     )
 
+    st.markdown("<div style='margin: 16px 0; border-top: 1px solid #334155;'></div>", unsafe_allow_html=True)
+
     st.markdown(
-        "<div style='margin: 16px 0; border-top: 1px solid #334155;'></div>",
+        """
+        <div style="font-size: 0.72rem; font-weight: 700; color: #38bdf8; letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 6px;">
+            Forecasting &amp; Dynamic Replanning
+        </div>
+        """,
         unsafe_allow_html=True,
     )
+
+    seasonality_label = st.selectbox(
+        "Demand Forecast Profile",
+        options=[
+            "Normal Baseline (Default)",
+            "Festival Surge (+10% to +30%)",
+            "Weekend Mandi Rush (+5% to +25%)",
+            "Monsoon Hospitality Dip (-5% to -25%)",
+        ],
+        index=0,
+        help="Forecasts destination mandi demand from event and seasonality indicators.",
+    )
+    seasonality_map: Dict[str, SeasonalityMode] = {
+        "Normal Baseline (Default)": "normal",
+        "Festival Surge (+10% to +30%)": "festival_surge",
+        "Weekend Mandi Rush (+5% to +25%)": "weekend_rush",
+        "Monsoon Hospitality Dip (-5% to -25%)": "monsoon_dip",
+    }
+    seasonality_mode: SeasonalityMode = seasonality_map[seasonality_label]
+
+    add_spot_order = st.checkbox(
+        "Inject Mid-Day Spot Order",
+        value=False,
+        help="Simulates an urgent 1,800 kg Tomato order from Mumbai Dark Stores at ₹42/kg.",
+    )
+    fleet_breakdown_pct = (
+        st.slider(
+            "Fleet Breakdown Capacity Loss (%)",
+            min_value=0,
+            max_value=50,
+            value=0,
+            step=10,
+            help="Simulates mid-day truck unavailability requiring dynamic route reallocation.",
+        )
+        / 100.0
+    )
+
+    st.markdown("<div style='margin: 16px 0; border-top: 1px solid #334155;'></div>", unsafe_allow_html=True)
 
     st.markdown(
         """
@@ -210,7 +383,6 @@ with st.sidebar:
         step=0.5,
         help="Minimum remaining shelf life upon arrival. Routes below this are marked infeasible.",
     )
-    st.caption("Lowering buffer allows rapid local sales; raising it enforces stricter quality margins.")
 
     max_discount = (
         st.slider(
@@ -223,11 +395,10 @@ with st.sidebar:
         )
         / 100.0
     )
-    st.caption("Calibrated clearance curve ensures rapid mandi absorption without margin erosion.")
 
     solver_label = st.selectbox(
         "Optimization Engine Mode",
-        options=["Urgency-Margin Heuristic (Default)", "SciPy HiGHS Linear Program (Exact LP)"],
+        options=["Urgency-Margin Heuristic (Ultra-Fast)", "SciPy HiGHS Linear Program (Very Accurate)"],
         index=0,
         help="Switch between Priority-Index heuristic and SciPy HiGHS Linear Programming.",
     )
@@ -235,10 +406,22 @@ with st.sidebar:
         "lp_highs" if "HiGHS" in solver_label else "urgency_margin"
     )
 
-    st.markdown(
-        "<div style='margin: 18px 0; border-top: 1px solid #334155;'></div>",
-        unsafe_allow_html=True,
-    )
+    with st.expander("Custom Scenario JSON"):
+        uploaded_file = st.file_uploader(
+            "Upload Custom Scenario (.json)",
+            type=["json"],
+            help="Upload a custom dataset with 'batches', 'destinations', and 'routes'.",
+        )
+        if uploaded_file is not None:
+            try:
+                raw_bytes = uploaded_file.getvalue()
+                load_scenario_from_json(raw_bytes)
+                custom_json_bytes = raw_bytes
+                st.success("Custom scenario validated & loaded!")
+            except (ValidationError, ValueError, KeyError) as exc:
+                st.error(f"Invalid scenario schema: {exc}")
+
+    st.markdown("<div style='margin: 18px 0; border-top: 1px solid #334155;'></div>", unsafe_allow_html=True)
 
     st.markdown(
         """
@@ -270,11 +453,13 @@ with st.sidebar:
 # ----------------- MAIN DASHBOARD CONTENT -----------------
 
 st.title("FreshRoute: Perishable Produce Distribution System")
-st.caption(
-    "PS 07 \u2014 IEEE RAS VITC Buildathon \u2014 Decision Support for MoFPI Post-Harvest Loss Mitigation"
-)
+st.caption("PS 07 — IEEE RAS VITC Buildathon — Decision Support for MoFPI Post-Harvest Loss Mitigation")
 
-base_res, fresh_res, mc_report, batch_df = run_cached_simulation(
+base_res, fresh_res, mc_report, batch_df, scenario_json = run_cached_simulation(
+    custom_json_bytes=custom_json_bytes,
+    seasonality_mode=seasonality_mode,
+    add_spot_order=add_spot_order,
+    fleet_breakdown_pct=fleet_breakdown_pct,
     disruption_active=disruption_toggle,
     transit_delay=transit_delay,
     demand_shock=demand_shock,
@@ -308,7 +493,7 @@ with row1_col1:
             else f"-{format_inr(abs(profit_gain))} ({profit_pct:.1f}%)"
         ),
         is_positive=profit_gain >= 0,
-        arrow="\u2191" if profit_gain >= 0 else "\u2193",
+        arrow="↑" if profit_gain >= 0 else "↓",
     )
 
 with row1_col2:
@@ -322,7 +507,7 @@ with row1_col2:
             else f"{spoilage_delta:+.2f}% pts increase"
         ),
         is_positive=spoilage_delta <= 0,
-        arrow="\u2193" if spoilage_delta <= 0 else "\u2191",
+        arrow="↓" if spoilage_delta <= 0 else "↑",
     )
 
 row2_col1, row2_col2 = st.columns(2)
@@ -333,7 +518,7 @@ with row2_col1:
         vs_val=f"{base_res.demand_fulfillment_pct:.2f}%",
         delta_text=f"{fulfill_delta:+.2f}% points",
         is_positive=fulfill_delta >= 0,
-        arrow="\u2191" if fulfill_delta >= 0 else "\u2193",
+        arrow="↑" if fulfill_delta >= 0 else "↓",
     )
 
 with row2_col2:
@@ -347,17 +532,17 @@ with row2_col2:
             else f"-{format_inr(abs(vol_delta), prefix='', decimals=0)} kg"
         ),
         is_positive=vol_delta >= 0,
-        arrow="\u2191" if vol_delta >= 0 else "\u2193",
+        arrow="↑" if vol_delta >= 0 else "↓",
     )
 
 st.markdown("---")
 
 tab1, tab2, tab3, tab4 = st.tabs(
     [
-        "Side-by-Side Comparison",
-        "Detailed Dispatch Plan & Audit",
+        "Side-by-Side Comparison & Flow",
+        "Dispatch Plan & Counterfactual Audit",
         "Uncertainty & Risk Analysis",
-        "Inventory Batches",
+        "Inventory & Scenario Export",
     ]
 )
 
@@ -390,7 +575,6 @@ with tab1:
         }
     )
 
-    # Colorblind-safe palette (Slate vs Sky Blue) + geometric pattern fills for accessibility
     fig_fin = go.Figure(
         data=[
             go.Bar(
@@ -412,6 +596,9 @@ with tab1:
         title="Financial Comparison (INR)",
         barmode="group",
         legend_title_text="Strategy",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#cbd5e1"),
     )
     vcol1.plotly_chart(fig_fin, use_container_width=True)
 
@@ -436,8 +623,14 @@ with tab1:
         title="Operational Efficiency Comparison (%)",
         barmode="group",
         legend_title_text="Strategy",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#cbd5e1"),
     )
     vcol2.plotly_chart(fig_metrics, use_container_width=True)
+
+    fig_sankey = build_sankey_figure(batch_df, fresh_res)
+    st.plotly_chart(fig_sankey, use_container_width=True)
 
     insights = DecisionExplainer.explain_comparison(base_res, fresh_res)
     st.info(
@@ -460,12 +653,46 @@ with tab2:
         mime="text/csv",
     )
 
+    st.markdown("---")
+    st.subheader(
+        f"Counterfactual Guardrail Log: Why Specific Routes Were Blocked ({len(fresh_res.rejected_routes)} Prevented)"
+    )
+    if fresh_res.rejected_routes:
+        rej_table = DecisionExplainer.generate_rejection_table(fresh_res.rejected_routes)
+        st.dataframe(rej_table, use_container_width=True)
+    else:
+        st.success("All candidate commodity corridors satisfied shelf-life and margin constraints.")
+
 with tab3:
-    st.subheader("Monte Carlo Sensitivity Analysis (\u00b110% Shelf-Life/Demand, \u00b115% Transit Uncertainty)")
+    st.subheader("Monte Carlo Sensitivity Analysis (±10% Shelf-Life/Demand, ±15% Transit Uncertainty)")
     ucol1, ucol2, ucol3 = st.columns(3)
     ucol1.metric("Expected Net Profit (Mean)", format_inr(mc_report.mean_net_profit))
     ucol2.metric("5th Percentile (Downside Risk)", format_inr(mc_report.p5_net_profit))
     ucol3.metric("95th Percentile (Upside Case)", format_inr(mc_report.p95_net_profit))
+
+    fig_mc = go.Figure()
+    fig_mc.add_trace(
+        go.Bar(
+            name="Profit Risk Bounds",
+            x=[mc_report.p5_net_profit, mc_report.mean_net_profit, mc_report.p95_net_profit],
+            y=["5th Percentile (P5)", "Expected Mean", "95th Percentile (P95)"],
+            orientation="h",
+            marker=dict(color=["#d97706", "#0284c7", "#38bdf8"]),
+            text=[format_inr(mc_report.p5_net_profit), format_inr(mc_report.mean_net_profit), format_inr(mc_report.p95_net_profit)],
+            textposition="auto",
+        )
+    )
+    fig_mc.update_layout(
+        title="Stochastic Profit Confidence Distribution (INR)",
+        xaxis_title="Net Profit (INR)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#cbd5e1"),
+        height=260,
+        margin=dict(l=10, r=10, t=40, b=10),
+    )
+    st.plotly_chart(fig_mc, use_container_width=True)
+
     st.caption(
         f"Evaluated across {mc_report.runs} stochastic scenarios: "
         f"Mean Spoilage = {mc_report.mean_spoilage_pct:.2f}%, "
@@ -476,3 +703,9 @@ with tab3:
 with tab4:
     st.subheader("Current Warehouse Inventory Batches (Nashik Central Hub)")
     st.dataframe(batch_df, use_container_width=True)
+    st.download_button(
+        label="Download Active Scenario Template (.json)",
+        data=scenario_json.encode("utf-8"),
+        file_name="freshroute_scenario.json",
+        mime="application/json",
+    )

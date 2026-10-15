@@ -1,4 +1,4 @@
-"""tests/test_freshroute.py: Comprehensive test suite covering constraints, LP, security, and edge cases."""
+"""tests/test_freshroute.py: 18-test verification suite covering constraints, LP, security, and edge cases."""
 
 import pytest
 from pydantic import ValidationError
@@ -7,7 +7,11 @@ from engine.baseline_solver import BaselineSolver
 from engine.data_generator import (
     apply_disruption,
     apply_temperature_excursion,
+    export_scenario_to_json,
+    forecast_destination_demand,
     get_standard_scenario,
+    inject_replanning_event,
+    load_scenario_from_json,
 )
 from engine.explainability import DecisionExplainer, format_inr, sanitize_csv_value
 from engine.freshroute_solver import FreshRouteSolver
@@ -75,8 +79,8 @@ def test_lp_highs_solver_mode():
     assert lp_res.demand_fulfillment_pct > baseline.demand_fulfillment_pct
 
 
-def test_max_reception_capacity_enforced():
-    """Verify destination max_reception_capacity_kg constraint caps allocations below demand_kg."""
+def test_max_reception_capacity_and_vehicle_cap_in_both_solvers():
+    """Verify both BaselineSolver and FreshRouteSolver respect tight vehicle and reception caps."""
     batches = [
         Batch(
             batch_id="B-TOM-CAP",
@@ -100,11 +104,77 @@ def test_max_reception_capacity_enforced():
     ]
     routes = [
         TransportRoute(
-            origin="Hub-A", dest_id="D-1", travel_time_hrs=2.0, cost_per_kg=2.0, vehicle_capacity_kg=5000.0
+            origin="Hub-A", dest_id="D-1", travel_time_hrs=2.0, cost_per_kg=2.0, vehicle_capacity_kg=900.0
         )
     ]
+    base_res = BaselineSolver().solve(batches, dests, routes)
+    fresh_res = FreshRouteSolver().solve(batches, dests, routes)
+    assert base_res.dispatched_kg == pytest.approx(900.0)
+    assert fresh_res.dispatched_kg == pytest.approx(900.0)
+
+
+def test_discount_ceiling_does_not_over_discount():
+    """Verify raising max_discount_pct above 25% does not erode net profit via unnecessary discounting."""
+    batches, dests, routes = get_standard_scenario()
+    res_25 = FreshRouteSolver(max_discount_pct=0.25).solve(batches, dests, routes)
+    res_40 = FreshRouteSolver(max_discount_pct=0.40).solve(batches, dests, routes)
+    assert res_40.net_profit >= res_25.net_profit
+
+
+def test_counterfactual_rejected_routes_logged():
+    """Verify infeasible routes (like 8h Spinach to 14h Goa) are captured in rejected_routes."""
+    batches, dests, routes = get_standard_scenario()
     res = FreshRouteSolver().solve(batches, dests, routes)
-    assert res.dispatched_kg == pytest.approx(1200.0)
+    assert len(res.rejected_routes) > 0
+    rej_df = DecisionExplainer.generate_rejection_table(res.rejected_routes)
+    assert not rej_df.empty
+    assert "SHELF_LIFE_VIOLATION" in rej_df["Guardrail Triggered"].values
+
+
+def test_seasonality_demand_forecasting():
+    """Verify festival surge increases demand and monsoon dip reduces demand."""
+    _, dests, _ = get_standard_scenario()
+    base_total = sum(d.demand_kg for d in dests)
+    surge_total = sum(d.demand_kg for d in forecast_destination_demand(dests, "festival_surge"))
+    dip_total = sum(d.demand_kg for d in forecast_destination_demand(dests, "monsoon_dip"))
+    assert surge_total > base_total > dip_total
+
+
+def test_dynamic_replanning_spot_order_and_breakdown():
+    """Verify mid-day spot order injection and fleet breakdown replanning."""
+    batches, dests, routes = get_standard_scenario()
+    b2, d2, r2 = inject_replanning_event(
+        batches, dests, routes, add_spot_order=True, fleet_breakdown_pct=0.20
+    )
+    assert len(d2) == len(dests) + 1
+    assert any(d.dest_id == "DEST-SPOT-MUM" for d in d2)
+    assert r2[0].vehicle_capacity_kg == pytest.approx(routes[0].vehicle_capacity_kg * 0.80)
+
+
+def test_json_scenario_roundtrip_and_size_guard():
+    """Verify custom JSON export/import roundtrip and security byte-size limit."""
+    batches, dests, routes = get_standard_scenario()
+    raw_json = export_scenario_to_json(batches, dests, routes)
+    b_loaded, d_loaded, r_loaded = load_scenario_from_json(raw_json)
+    assert len(b_loaded) == len(batches)
+    assert len(d_loaded) == len(dests)
+    assert len(r_loaded) == len(routes)
+
+    with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+        load_scenario_from_json(raw_json, max_bytes=10)
+
+
+def test_boundary_empty_and_100pct_infeasible_network():
+    """Verify solvers handle empty inputs and 100% blocked networks without ZeroDivisionError."""
+    empty_res = FreshRouteSolver().solve([], [], [])
+    assert empty_res.net_profit == 0.0
+    assert empty_res.spoilage_rate_pct == 0.0
+
+    batches, dests, routes = get_standard_scenario()
+    impossible_routes, _ = apply_disruption(routes, dests, delay_hours=500.0, demand_shock_pct=0.0)
+    blocked_res = FreshRouteSolver().solve(batches, dests, impossible_routes)
+    assert blocked_res.dispatched_kg == 0.0
+    assert len(blocked_res.allocations) == 0
 
 
 def test_clearance_elasticity_and_fulfillment_alignment():

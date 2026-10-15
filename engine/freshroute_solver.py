@@ -1,4 +1,4 @@
-"""engine/freshroute_solver.py: Constrained Optimization Solver with Clearance Elasticity & LP Support."""
+"""engine/freshroute_solver.py: Constrained Optimization Solver with Counterfactual Audit & LP Support."""
 
 from collections import defaultdict
 import time
@@ -12,6 +12,7 @@ from .models import (
     Batch,
     Destination,
     OptimizationSummary,
+    RejectedRoute,
     TransportRoute,
     UncertaintyReport,
 )
@@ -23,7 +24,7 @@ class FreshRouteSolver:
     1. Feasibility: Enforces remaining_shelf_life >= travel_time + handling_time + min_safe_buffer.
     2. Targeted Dynamic Clearance: Applies calibrated discounts (0-25%) when arrival buffer < 12h
        to stimulate rapid mandi absorption and prevent commercial dock rejection.
-    3. Clearance Elasticity: Models buyer absorption velocity when discounts are constrained.
+    3. Counterfactual Audit Logging: Records every rejected (Batch, Destination) pair and why.
     4. Dual Solver Support:
        - 'urgency_margin': Priority-Index greedy dispatch (fast, deterministic explainability).
        - 'lp_highs': Exact Linear Programming via SciPy HiGHS simplex/interior-point solver.
@@ -55,11 +56,8 @@ class FreshRouteSolver:
     def calculate_discount_and_clearance(self, buffer_hrs: float) -> Tuple[float, float, str]:
         """
         Calculates dynamic discount and expected market clearance rate.
-        Disclosed Rule:
-        - When arrival buffer >= 12.0h, 0% discount is required (100% clearance).
-        - When 2.0h <= arrival buffer < 12.0h, urgency scales linearly:
-          urgency = (12.0 - buffer) / 12.0.
-        - Market requires at least `urgency * 20%` discount for 100% immediate absorption.
+        Caps effective discount slope at 0.25 so raising the policy ceiling above 25%
+        never over-discounts produce that already achieves 100% clearance.
         """
         if buffer_hrs <= 0:
             return 0.0, 0.0, "EXPIRED"
@@ -68,7 +66,8 @@ class FreshRouteSolver:
 
         urgency = (self.discount_threshold_hrs - buffer_hrs) / self.discount_threshold_hrs
         required_clearance_discount = urgency * 0.20
-        actual_discount = round(urgency * self.max_discount_pct, 2)
+        effective_ceiling = min(self.max_discount_pct, 0.25)
+        actual_discount = round(urgency * effective_ceiling, 2)
 
         if actual_discount >= required_clearance_discount:
             clearance_rate = 1.0
@@ -92,22 +91,58 @@ class FreshRouteSolver:
         batches: List[Batch],
         destinations: List[Destination],
         route_map: Dict[Tuple[str, str], TransportRoute],
-    ) -> List[Dict[str, Any]]:
-        """Builds feasible (batch, destination) candidate arcs using O(B + D) commodity indexing."""
+    ) -> Tuple[List[Dict[str, Any]], List[RejectedRoute]]:
+        """
+        Builds feasible (batch, destination) candidate arcs using O(B + D) commodity indexing
+        and logs counterfactual rejection reasons for every infeasible pair.
+        """
         dests_by_commodity: Dict[str, List[Destination]] = defaultdict(list)
         for d in destinations:
             dests_by_commodity[d.commodity].append(d)
 
         candidates: List[Dict[str, Any]] = []
+        rejected_routes: List[RejectedRoute] = []
+
         for b in batches:
             for d in dests_by_commodity.get(b.commodity, []):
                 route = route_map.get((b.origin, d.dest_id))
                 if not route:
+                    rejected_routes.append(
+                        RejectedRoute(
+                            batch_id=b.batch_id,
+                            dest_id=d.dest_id,
+                            destination_name=d.name,
+                            commodity=b.commodity,
+                            remaining_shelf_life_hrs=b.remaining_shelf_life_hrs,
+                            required_transit_and_handling_hrs=0.0,
+                            projected_buffer_hrs=0.0,
+                            rejection_category="NO_ROUTE",
+                            reason=f"No active transport corridor from {b.origin} to {d.dest_id}.",
+                        )
+                    )
                     continue
 
                 total_transit_hrs = route.travel_time_hrs + d.handling_time_hrs
                 buffer_hrs = b.remaining_shelf_life_hrs - total_transit_hrs
+
                 if buffer_hrs < self.min_safe_buffer_hrs:
+                    rejected_routes.append(
+                        RejectedRoute(
+                            batch_id=b.batch_id,
+                            dest_id=d.dest_id,
+                            destination_name=d.name,
+                            commodity=b.commodity,
+                            remaining_shelf_life_hrs=b.remaining_shelf_life_hrs,
+                            required_transit_and_handling_hrs=round(total_transit_hrs, 1),
+                            projected_buffer_hrs=round(buffer_hrs, 1),
+                            rejection_category="SHELF_LIFE_VIOLATION",
+                            reason=(
+                                f"Blocked: Arrival buffer {buffer_hrs:.1f}h < {self.min_safe_buffer_hrs:.1f}h "
+                                f"safe threshold (Shelf life {b.remaining_shelf_life_hrs:.1f}h vs "
+                                f"{route.travel_time_hrs:.1f}h transit + {d.handling_time_hrs:.1f}h handling)."
+                            ),
+                        )
+                    )
                     continue
 
                 discount_pct, clearance_rate, discount_reason = (
@@ -122,6 +157,22 @@ class FreshRouteSolver:
                 )
 
                 if unit_margin <= 0:
+                    rejected_routes.append(
+                        RejectedRoute(
+                            batch_id=b.batch_id,
+                            dest_id=d.dest_id,
+                            destination_name=d.name,
+                            commodity=b.commodity,
+                            remaining_shelf_life_hrs=b.remaining_shelf_life_hrs,
+                            required_transit_and_handling_hrs=round(total_transit_hrs, 1),
+                            projected_buffer_hrs=round(buffer_hrs, 1),
+                            rejection_category="NEGATIVE_MARGIN",
+                            reason=(
+                                f"Blocked: Net unit contribution \u20b9{unit_margin:.2f}/kg <= 0 after "
+                                f"\u20b9{route.cost_per_kg:.1f}/kg freight and \u20b9{b.base_cost_per_kg:.1f}/kg base cost."
+                            ),
+                        )
+                    )
                     continue
 
                 urgency_multiplier = 1.0 + (3.0 / max(b.remaining_shelf_life_hrs, 1.0))
@@ -144,7 +195,7 @@ class FreshRouteSolver:
                 )
 
         candidates.sort(key=lambda x: x["priority_index"], reverse=True)
-        return candidates
+        return candidates, rejected_routes
 
     def _allocate_lp(
         self,
@@ -158,7 +209,6 @@ class FreshRouteSolver:
             return []
 
         n_vars = len(candidates)
-        # Maximize priority-weighted net contribution (avoiding perishable warehouse expiration penalties)
         c = np.array(
             [
                 -(
@@ -174,7 +224,6 @@ class FreshRouteSolver:
         rows: List[np.ndarray] = []
         rhs: List[float] = []
 
-        # 1. Batch supply constraints
         for b in batches:
             row = np.zeros(n_vars, dtype=float)
             has_arc = False
@@ -186,7 +235,6 @@ class FreshRouteSolver:
                 rows.append(row)
                 rhs.append(b.quantity_kg)
 
-        # 2. Destination demand & reception capacity constraints
         for d in destinations:
             row = np.zeros(n_vars, dtype=float)
             has_arc = False
@@ -203,7 +251,6 @@ class FreshRouteSolver:
                 rows.append(row)
                 rhs.append(cap_limit)
 
-        # 3. Route vehicle capacity constraints
         for r in routes:
             row = np.zeros(n_vars, dtype=float)
             has_arc = False
@@ -248,7 +295,7 @@ class FreshRouteSolver:
         remaining_route_cap = {(r.origin, r.dest_id): r.vehicle_capacity_kg for r in routes}
         total_inventory_kg = sum(b.quantity_kg for b in batches)
 
-        candidates = self._build_candidates(batches, destinations, route_map)
+        candidates, rejected_routes = self._build_candidates(batches, destinations, route_map)
         batch_remaining_qty = {b.batch_id: b.quantity_kg for b in batches}
         allocations: List[AllocationDecision] = []
         dispatched_kg = 0.0
@@ -257,6 +304,8 @@ class FreshRouteSolver:
 
         if self.solver_mode == "lp_highs":
             planned_dispatch = self._allocate_lp(candidates, batches, destinations, routes)
+            for cand, alloc_qty in planned_dispatch:
+                batch_remaining_qty[cand["batch"].batch_id] -= alloc_qty
         else:
             planned_dispatch = []
             for cand in candidates:
@@ -276,10 +325,6 @@ class FreshRouteSolver:
                 remaining_demand[d.dest_id] -= alloc_qty
                 remaining_route_cap[(r.origin, r.dest_id)] -= alloc_qty
                 planned_dispatch.append((cand, alloc_qty))
-
-        if self.solver_mode == "lp_highs":
-            for cand, alloc_qty in planned_dispatch:
-                batch_remaining_qty[cand["batch"].batch_id] -= alloc_qty
 
         for cand, alloc_qty in planned_dispatch:
             b = cand["batch"]
@@ -328,7 +373,6 @@ class FreshRouteSolver:
                 )
             )
 
-        # Unallocated inventory expiring in warehouse within 24h planning horizon
         for b in batches:
             rem = max(0.0, batch_remaining_qty[b.batch_id])
             if rem > 0 and b.remaining_shelf_life_hrs <= 24.0:
@@ -362,6 +406,7 @@ class FreshRouteSolver:
             net_profit=round(net_profit, 2),
             solve_time_ms=round(elapsed_ms, 3),
             allocations=allocations,
+            rejected_routes=rejected_routes,
         )
 
     def evaluate_uncertainty(

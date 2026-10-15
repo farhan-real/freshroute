@@ -1,12 +1,18 @@
-"""run_demo.py: One-command benchmark evaluator with Indian Numbering System and accessible CLI modes."""
+"""run_demo.py: One-command benchmark evaluator with custom JSON scenario ingestion & accessible CLI."""
 
 import argparse
 import io
+from pathlib import Path
 import sys
+from typing import Optional
 from tabulate import tabulate
 
 from engine.baseline_solver import BaselineSolver
-from engine.data_generator import apply_disruption, get_standard_scenario
+from engine.data_generator import (
+    apply_disruption,
+    get_standard_scenario,
+    load_scenario_from_json,
+)
 from engine.explainability import DecisionExplainer, format_inr
 from engine.freshroute_solver import FreshRouteSolver
 
@@ -20,7 +26,7 @@ def configure_utf8_output() -> None:
             pass
 
 
-def run_benchmark(ascii_mode: bool = False) -> None:
+def run_benchmark(ascii_mode: bool = False, scenario_path: Optional[str] = None) -> None:
     configure_utf8_output()
     currency = "INR " if ascii_mode else "\u20b9"
     bullet = "*" if ascii_mode else "\u2022"
@@ -30,7 +36,12 @@ def run_benchmark(ascii_mode: bool = False) -> None:
     print("  FRESHROUTE: PERISHABLE PRODUCE DECISION-SUPPORT BENCHMARK")
     print("=" * 80)
 
-    batches, dests, routes = get_standard_scenario()
+    if scenario_path:
+        raw_bytes = Path(scenario_path).read_bytes()
+        batches, dests, routes = load_scenario_from_json(raw_bytes)
+        print(f"\n[LOADED CUSTOM SCENARIO: {scenario_path}]")
+    else:
+        batches, dests, routes = get_standard_scenario()
 
     baseline_solver = BaselineSolver()
     fresh_solver = FreshRouteSolver()
@@ -114,11 +125,13 @@ def run_benchmark(ascii_mode: bool = False) -> None:
         f"+{fresh_res.demand_fulfillment_pct - base_res.demand_fulfillment_pct:.2f}% points higher demand fulfillment"
     )
     print(
+        f"{bullet} Infeasible Routes Blocked: {len(fresh_res.rejected_routes)} unsafe/unprofitable corridors prevented"
+    )
+    print(
         f"{bullet} Key Driver: FreshRoute eliminated in-transit spoilage via arrival buffer enforcement "
         "and liquidated tight-buffer produce via targeted dynamic discounting."
     )
 
-    # Stress Test
     print("\n" + "=" * 80)
     print("  STRESS TEST: MONSOON DELAY (+6h Highway Blockade, -30% Demand Shock)")
     print("=" * 80)
@@ -152,7 +165,6 @@ def run_benchmark(ascii_mode: bool = False) -> None:
         )
     )
 
-    # Monte Carlo Uncertainty Report
     mc_report = fresh_solver.evaluate_uncertainty(batches, dests, routes, runs=30)
     print("\n[MONTE CARLO UNCERTAINTY ANALYSIS (30 STOCHASTIC RUNS)]")
     print(
@@ -164,21 +176,22 @@ def run_benchmark(ascii_mode: bool = False) -> None:
     print("\n[SAMPLE AUDIT TRAIL - FIRST 5 ALLOCATIONS]")
     audit_df = DecisionExplainer.generate_audit_table(fresh_res.allocations)
     margin_col = "Net Margin (\u20b9/kg)"
-    print(
-        audit_df[
-            [
-                "Batch",
-                "Commodity",
-                "Destination",
-                "Quantity (kg)",
-                "Buffer Upon Arrival (h)",
-                "Discount %",
-                margin_col,
+    if not audit_df.empty:
+        print(
+            audit_df[
+                [
+                    "Batch",
+                    "Commodity",
+                    "Destination",
+                    "Quantity (kg)",
+                    "Buffer Upon Arrival (h)",
+                    "Discount %",
+                    margin_col,
+                ]
             ]
-        ]
-        .head(5)
-        .to_string(index=False)
-    )
+            .head(5)
+            .to_string(index=False)
+        )
     print("\nBenchmark completed successfully.")
 
 
@@ -189,5 +202,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Use ASCII-only output for screen readers and legacy terminal environments.",
     )
+    parser.add_argument(
+        "--scenario",
+        type=str,
+        default=None,
+        help="Optional path to a custom scenario JSON file for hidden judge evaluations.",
+    )
     args = parser.parse_args()
-    run_benchmark(ascii_mode=args.ascii)
+    run_benchmark(ascii_mode=args.ascii, scenario_path=args.scenario)
